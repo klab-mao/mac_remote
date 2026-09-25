@@ -27,13 +27,7 @@ final class Streamer {
         flow.sendControl(.hello)
     }
 
-    private var sendInputDebugCount = 0
-
     func sendInput(_ packet: InputPacket) {
-        if sendInputDebugCount < 5 {
-            sendInputDebugCount += 1
-            print("sendInput #\(sendInputDebugCount): kind=\(packet.kind) button=\(packet.button) nx=\(packet.nx) ny=\(packet.ny)")
-        }
         flow.send(type: .input, payload: packet.encode())
     }
 

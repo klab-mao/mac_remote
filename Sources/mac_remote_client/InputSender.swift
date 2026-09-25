@@ -60,8 +60,6 @@ final class VideoView: NSView {
         }
     }
 
-    private static var npDebugCount = 0
-
     func normalizedPoint(for event: NSEvent) -> (nx: Float, ny: Float)? {
         let local = convert(event.locationInWindow, from: nil)
         var vw = bounds.width
@@ -69,10 +67,6 @@ final class VideoView: NSView {
         if vw <= 0 || vh <= 0, let win = window {
             vw = win.contentView?.frame.width ?? 0
             vh = win.contentView?.frame.height ?? 0
-        }
-        if VideoView.npDebugCount < 10 {
-            VideoView.npDebugCount += 1
-            print("normalizedPoint #\(VideoView.npDebugCount): vw=\(vw) vh=\(vh) remoteSize=\(remoteSize) bounds=\(bounds.size) locInWin=\(event.locationInWindow) local=\(local)")
         }
         guard vw > 0, vh > 0, remoteSize.width > 0, remoteSize.height > 0 else {
             print("normalizedPoint nil: bounds=\(bounds.size) winFrame=\(window?.frame.size ?? .zero) remoteSize=\(remoteSize) locInWin=\(event.locationInWindow)")
@@ -147,8 +141,6 @@ final class InputSender {
                     print("input captured #\(self.captureDebugCount): kind=\(packet.kind) button=\(packet.button) nx=\(packet.nx) ny=\(packet.ny)")
                 }
                 self.streamer.sendInput(packet)
-            } else if self.captureDebugCount < 5 {
-                print("packet nil: event.type=\(event.type) — NOT sending")
             }
             return nil
         }
@@ -160,8 +152,6 @@ final class InputSender {
 
     private func packet(from event: NSEvent) -> InputPacket? {
         let flags = UInt32(event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue)
-        let keyCode = UInt16(clamping: event.keyCode)
-        let click = UInt32(clamping: event.clickCount)
 
         switch event.type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
@@ -177,6 +167,7 @@ final class InputSender {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
             guard let n = view.normalizedPoint(for: event) else { return nil }
             let button: UInt8 = event.type == .leftMouseDown ? 0 : (event.type == .rightMouseDown ? 1 : 2)
+            let click = UInt32(clamping: event.clickCount)
             return InputPacket(kind: .mouseDown, button: button, flags: flags, nx: n.nx, ny: n.ny, clickCount: click)
 
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
@@ -188,12 +179,15 @@ final class InputSender {
             return InputPacket(kind: .scroll, flags: flags, dx: Float(event.scrollingDeltaX), dy: Float(event.scrollingDeltaY))
 
         case .keyDown:
+            let keyCode = UInt16(clamping: event.keyCode)
             return InputPacket(kind: .keyDown, keyCode: keyCode, flags: flags)
 
         case .keyUp:
+            let keyCode = UInt16(clamping: event.keyCode)
             return InputPacket(kind: .keyUp, keyCode: keyCode, flags: flags)
 
         case .flagsChanged:
+            let keyCode = UInt16(clamping: event.keyCode)
             return InputPacket(kind: .flagsChanged, keyCode: keyCode, flags: flags)
 
         default:
