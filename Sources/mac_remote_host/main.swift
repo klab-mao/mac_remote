@@ -9,6 +9,7 @@ final class HostEngine {
     private let fps: Int
     private let bitrateMbps: Int
     private let displayIndex: Int
+    private let clientTimeout: TimeInterval
 
     private let capture = CaptureEngine()
     private let encoder = H264Encoder()
@@ -16,12 +17,15 @@ final class HostEngine {
     private var activeFlow: UDPFlow?
     private var frameId: UInt32 = 0
     private var currentDisplayID: CGDirectDisplayID = CGMainDisplayID()
+    private var lastClientActivity: Date = .distantPast
+    private var clientTimedOut = false
 
-    init(port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int) {
+    init(port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int, clientTimeout: TimeInterval) {
         self.port = port
         self.fps = fps
         self.bitrateMbps = bitrateMbps
         self.displayIndex = displayIndex
+        self.clientTimeout = clientTimeout
     }
 
     func start() {
@@ -58,6 +62,11 @@ final class HostEngine {
         print("Client flow connected")
         flow.onPacket = { [weak self] header, payload in
             guard let self else { return }
+            self.lastClientActivity = Date()
+            if self.clientTimedOut {
+                self.clientTimedOut = false
+                print("Client reconnected, resuming video")
+            }
             switch header.type {
             case .control:
                 self.handleControl(payload: payload, flow: flow)
@@ -146,6 +155,15 @@ final class HostEngine {
     private func handleEncoded(data: Data, isKeyframe: Bool, sps: Data, pps: Data) {
         guard let flow = activeFlow else { return }
 
+        let elapsed = Date().timeIntervalSince(lastClientActivity)
+        if elapsed > clientTimeout {
+            if !clientTimedOut {
+                clientTimedOut = true
+                print("Client inactive for \(Int(elapsed))s — stopping video (timeout=\(Int(clientTimeout))s)")
+            }
+            return
+        }
+
         if encodedDebugCount < 3 {
             encodedDebugCount += 1
             print("encoded #\(encodedDebugCount): \(data.count) bytes, keyframe=\(isKeyframe), frags=\((data.count + 1299) / 1300)")
@@ -169,11 +187,12 @@ final class HostEngine {
     }
 }
 
-func parseArgs() -> (port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int) {
+func parseArgs() -> (port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int, clientTimeout: TimeInterval) {
     var port: UInt16 = 42420
     var fps = 60
     var bitrate = 25
     var displayIndex = 0
+    var clientTimeout: TimeInterval = 10
     let args = CommandLine.arguments
     var i = 1
     while i < args.count {
@@ -190,12 +209,15 @@ func parseArgs() -> (port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int
         case "--display":
             if i + 1 < args.count { displayIndex = Int(args[i + 1]) ?? displayIndex }
             i += 1
+        case "--client-timeout":
+            if i + 1 < args.count { clientTimeout = Double(args[i + 1]) ?? clientTimeout }
+            i += 1
         default:
             break
         }
         i += 1
     }
-    return (port, fps, bitrate, displayIndex)
+    return (port, fps, bitrate, displayIndex, clientTimeout)
 }
 
 let config = parseArgs()
@@ -212,7 +234,7 @@ print("Screen Recording permission: \(screenOK ? "GRANTED" : "NOT GRANTED (captu
 let axOK = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
 print("Accessibility permission: \(axOK ? "GRANTED" : "NOT GRANTED (mouse/keyboard injection will silently fail until enabled in System Settings > Privacy & Security > Accessibility, then restart)")")
 
-let engine = HostEngine(port: config.port, fps: config.fps, bitrateMbps: config.bitrateMbps, displayIndex: config.displayIndex)
+let engine = HostEngine(port: config.port, fps: config.fps, bitrateMbps: config.bitrateMbps, displayIndex: config.displayIndex, clientTimeout: config.clientTimeout)
 engine.start()
 
 app.run()

@@ -83,7 +83,7 @@ Accessibility permission: GRANTED
 ### Host (the Mac being controlled)
 
 ```sh
-.build/out/Products/Debug/mac_remote_host [--port 42420] [--fps 60] [--bitrate 25] [--display 0]
+.build/out/Products/Debug/mac_remote_host [--port 42420] [--fps 60] [--bitrate 25] [--display 0] [--client-timeout 10]
 ```
 
 | Flag | Default | Description |
@@ -92,6 +92,7 @@ Accessibility permission: GRANTED
 | `--fps` | 60 | capture/encode framerate |
 | `--bitrate` | 25 | H.264 bitrate in Mbps (use 40-80 on LAN for near-lossless text) |
 | `--display` | 0 | initial display index (use `--display 1` for second monitor) |
+| `--client-timeout` | 10 | seconds without client packets before stopping video (0 = never timeout) |
 
 The host enumerates all displays at startup and prints them:
 ```
@@ -183,6 +184,39 @@ If clicks aren't working, check:
 3. Client prints `input captured #1:` — if not, `normalizedPoint` is returning nil (check for `normalizedPoint nil:` log showing zero bounds/remoteSize).
 4. Client prints `displayLayer FAILED` — video decode layer failed, will request keyframe.
 
+## Disconnect / reconnect
+
+### Client timeout (bandwidth saving)
+
+The host tracks the last time a packet was received from the client. If no packet arrives within `--client-timeout` seconds (default 10), the host stops sending video frames and logs:
+
+```
+Client inactive for 12s — stopping video (timeout=10s)
+```
+
+The capture engine keeps running (for fast resume), but no network traffic is generated. When the client sends any packet again (hello, input, keyframe request), the host immediately resumes:
+
+```
+Client reconnected, resuming video
+```
+
+The client continuously sends hello + keyframe requests every 0.5s as a heartbeat, so the host can detect reconnection within 1 second.
+
+### VPN disconnect
+
+If a company VPN drops mid-session:
+
+1. **UDP packets are lost** — neither side receives the other's packets while the VPN is down.
+2. **Host stops sending** after `--client-timeout` seconds of no client packets.
+3. **Client detects no video** after 5s and logs `No video for 5s — reconnecting (sending hello...)`.
+4. **When VPN resumes**, the client's heartbeat hello packets reach the host again, the host resumes sending, and the client logs `Reconnected — video resumed`.
+
+No manual restart is needed. The connection self-heals as long as the VPN comes back. If the VPN is down longer than the host's timeout, there may be a brief delay (1-2s) while the host waits for a keyframe request before resuming.
+
+### Single-display bandwidth
+
+The host only captures and sends **one display at a time** — the one the client is currently viewing. Switching displays (Cmd+Shift+D) tells the host to stop capturing the old display and start capturing the new one. No bandwidth is wasted on displays the client isn't viewing.
+
 ## Known issues
 
 - **Video may stall after initial frames** — `AVSampleBufferDisplayLayer` can fail after a few frames, possibly due to large keyframe fragment loss on UDP or sample buffer timing. The client detects `.failed` status, flushes, and requests a keyframe. Under investigation.
@@ -197,5 +231,5 @@ If clicks aren't working, check:
 - Adaptive bitrate based on packet loss / RTT (ping packet type reserved in protocol).
 - HEVC/AV1 encode option (VideoToolbox supports both on Apple Silicon).
 - Clipboard sync channel.
-- Auto-reconnect + persistent connection.
+- Pause capture engine (not just skip send) when client times out, to save CPU.
 - LaunchDaemon / menu-bar app packaging for the host.

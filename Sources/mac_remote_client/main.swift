@@ -14,7 +14,10 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
     private var inputSender: InputSender?
     private var keyframeTimer: Timer?
     private var fpsTimer: Timer?
+    private var reconnectTimer: Timer?
     private var frameCount = 0
+    private var lastFrameTime = Date()
+    private var isReconnecting = false
 
     init(host: String, port: UInt16) {
         self.host = host
@@ -50,6 +53,11 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
         streamer.onVideoFrame = { [weak self, weak view] sampleBuffer in
             guard let self, let view else { return }
             self.frameCount += 1
+            self.lastFrameTime = Date()
+            if self.isReconnecting {
+                self.isReconnecting = false
+                print("Reconnected — video resumed")
+            }
             let layer = view.displayLayer
             DispatchQueue.main.async {
                 if layer.status == .failed {
@@ -99,6 +107,15 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
             let fps = self.frameCount
             self.frameCount = 0
             print("fps: \(fps)")
+        }
+
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let elapsed = Date().timeIntervalSince(self.lastFrameTime)
+            if elapsed > 5 && !self.isReconnecting {
+                self.isReconnecting = true
+                print("No video for \(Int(elapsed))s — reconnecting (sending hello...)")
+            }
         }
     }
 
