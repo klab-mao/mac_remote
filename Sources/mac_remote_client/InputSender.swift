@@ -60,6 +60,8 @@ final class VideoView: NSView {
         }
     }
 
+    private static var npDebugCount = 0
+
     func normalizedPoint(for event: NSEvent) -> (nx: Float, ny: Float)? {
         let local = convert(event.locationInWindow, from: nil)
         var vw = bounds.width
@@ -67,6 +69,10 @@ final class VideoView: NSView {
         if vw <= 0 || vh <= 0, let win = window {
             vw = win.contentView?.frame.width ?? 0
             vh = win.contentView?.frame.height ?? 0
+        }
+        if VideoView.npDebugCount < 10 {
+            VideoView.npDebugCount += 1
+            print("normalizedPoint #\(VideoView.npDebugCount): vw=\(vw) vh=\(vh) remoteSize=\(remoteSize) bounds=\(bounds.size) locInWin=\(event.locationInWindow) local=\(local)")
         }
         guard vw > 0, vh > 0, remoteSize.width > 0, remoteSize.height > 0 else {
             print("normalizedPoint nil: bounds=\(bounds.size) winFrame=\(window?.frame.size ?? .zero) remoteSize=\(remoteSize) locInWin=\(event.locationInWindow)")
@@ -141,6 +147,8 @@ final class InputSender {
                     print("input captured #\(self.captureDebugCount): kind=\(packet.kind) button=\(packet.button) nx=\(packet.nx) ny=\(packet.ny)")
                 }
                 self.streamer.sendInput(packet)
+            } else if self.captureDebugCount < 5 {
+                print("packet nil: event.type=\(event.type) — NOT sending")
             }
             return nil
         }
