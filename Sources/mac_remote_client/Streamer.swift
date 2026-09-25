@@ -9,6 +9,8 @@ final class Streamer {
     var onRemoteSize: ((CGSize) -> Void)?
     var onFirstFrame: (() -> Void)?
     var onDisplayInfo: ((Int, Int) -> Void)?
+    var onUnlockResult: ((UnlockResultCode) -> Void)?
+    var onLockState: ((Bool) -> Void)?
 
     private let flow: UDPFlow
     private let assembler = FrameAssembler()
@@ -44,6 +46,10 @@ final class Streamer {
         flow.sendDatagram(Packetizer.controlPacket(.switchDisplay, extra: Data([index])))
     }
 
+    func sendUnlock(password: String) {
+        flow.sendControl(.unlockRequest, extra: Data(password.utf8))
+    }
+
     private func handle(header: PacketHeader, payload: Data) {
         switch header.type {
         case .video:
@@ -70,6 +76,12 @@ final class Streamer {
         case .displayInfo:
             guard payload.count >= 3 else { return }
             onDisplayInfo?(Int(payload[1]), Int(payload[2]))
+        case .unlockResult:
+            guard payload.count >= 2, let code = UnlockResultCode(rawValue: payload[1]) else { return }
+            onUnlockResult?(code)
+        case .lockState:
+            guard payload.count >= 2 else { return }
+            onLockState?(payload[1] != 0)
         default:
             break
         }

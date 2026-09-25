@@ -134,8 +134,26 @@ The client opens a borderless fullscreen window (level: floating, activation pol
 |-----|--------|
 | **ESC** | Quit the client |
 | **Cmd+Shift+D** | Cycle to the next display on the host |
+| **Cmd+Shift+U** | Unlock the remote Mac's lock screen (prompts for password) |
 
 When switching displays, an overlay shows `Display X / Y` for ~2.5 seconds. The host reconfigures the encoder if the new display has a different resolution and forces a keyframe.
+
+### Screen lock / unlock
+
+The host watches `com.apple.screenIsLocked` / `com.apple.screenIsUnlocked` distributed notifications and reports lock state changes to the client (shown as a transient overlay).
+
+To unlock a locked remote Mac, press **Cmd+Shift+U** on the client, enter the host's login password, and confirm. The host then:
+
+1. Wakes the displays (power assertion + mouse nudge),
+2. Types the password into the loginwindow password field via synthetic CGEvents (US ANSI key mapping), and presses Return,
+3. Verifies the result by polling the session lock state (`CGSessionCopyCurrentDictionary`) for up to 3s and reports a result code back to the client.
+
+**Limitations:**
+
+- **Secure Event Input** — macOS may block synthetic keyboard events from reaching the loginwindow password field (this is an intentional security hardening). The host self-verifies and the client shows `Unlock failed — still locked` if it didn't work. In that case, unlock once physically. There is no supported way for a non-privileged process to bypass Secure Input.
+- **Password characters are limited to the US ANSI printable set** (letters, digits, common punctuation). Passwords with other characters are rejected with a clear message rather than typed incorrectly.
+- **The password travels unencrypted over UDP** in cleartext — this tool is designed for trusted LAN/VPN use only.
+- Apple Watch / Touch ID unlock cannot be triggered remotely.
 
 ## Protocol
 
@@ -162,6 +180,9 @@ When switching displays, an overlay shows `Display X / Y` for ~2.5 seconds. The 
 | 3 | keyframeRequest | client→host | — |
 | 4 | switchDisplay | client→host | display index (255 = cycle next) |
 | 5 | displayInfo | host→client | current index, total count |
+| 6 | unlockRequest | client→host | password (UTF-8) |
+| 7 | unlockResult | host→client | result code (0=unlocked, 1=notLocked, 2=stillLocked, 3=unsupportedCharacter, 4=error) |
+| 8 | lockState | host→client | 1 = locked, 0 = unlocked |
 
 ### Input packet (28 bytes)
 

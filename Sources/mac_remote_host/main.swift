@@ -37,6 +37,11 @@ final class HostEngine {
         self.listener = listener
         print("Host listening on UDP port \(port)")
 
+        ScreenLock.startTracking { [weak self] locked in
+            print("Screen \(locked ? "locked" : "unlocked")")
+            self?.sendLockState()
+        }
+
         encoder.onEncodedFrame = { [weak self] data, isKeyframe, sps, pps in
             self?.handleEncoded(data: data, isKeyframe: isKeyframe, sps: sps, pps: pps)
         }
@@ -95,9 +100,35 @@ final class HostEngine {
             let requested = Int(payload[1])
             let target = requested == 255 ? (capture.currentIndex + 1) % max(capture.displayCount, 1) : requested
             switchDisplay(to: target)
+        case .unlockRequest:
+            // payload: [subtype][password utf8 bytes]
+            guard payload.count >= 2 else { return }
+            let password = String(data: payload.subdata(in: 1..<payload.count), encoding: .utf8) ?? ""
+            activeFlow = flow
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let result = ScreenLock.unlock(password: password)
+                print("Unlock attempt result: \(result)")
+                self?.sendUnlockResult(result)
+            }
         default:
             break
         }
+    }
+
+    private func sendUnlockResult(_ result: UnlockResultCode) {
+        guard let flow = activeFlow else { return }
+        var payload = Data()
+        payload.append(ControlSubType.unlockResult.rawValue)
+        payload.append(result.rawValue)
+        flow.send(type: .control, frameId: 0, fragIndex: 0, fragCount: 1, payload: payload)
+    }
+
+    private func sendLockState() {
+        guard let flow = activeFlow else { return }
+        var payload = Data()
+        payload.append(ControlSubType.lockState.rawValue)
+        payload.append(ScreenLock.isLocked ? 1 : 0)
+        flow.send(type: .control, frameId: 0, fragIndex: 0, fragCount: 1, payload: payload)
     }
 
     private var inputDebugCount = 0

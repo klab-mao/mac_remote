@@ -13,6 +13,17 @@ public enum ControlSubType: UInt8 {
     case keyframeRequest = 3
     case switchDisplay = 4
     case displayInfo = 5
+    case unlockRequest = 6
+    case unlockResult = 7
+    case lockState = 8
+}
+
+public enum UnlockResultCode: UInt8 {
+    case unlocked = 0
+    case notLocked = 1
+    case stillLocked = 2
+    case unsupportedCharacter = 3
+    case error = 4
 }
 
 public enum InputKind: UInt8 {

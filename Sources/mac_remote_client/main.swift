@@ -82,9 +82,34 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        streamer.onUnlockResult = { [weak self] code in
+            DispatchQueue.main.async {
+                let msg: String
+                switch code {
+                case .unlocked: msg = "Unlocked"
+                case .notLocked: msg = "Screen was not locked"
+                case .stillLocked: msg = "Unlock failed — still locked. Secure Event Input may block synthetic keys; unlock once physically if this persists."
+                case .unsupportedCharacter: msg = "Password contains characters unsupported by the US key mapping"
+                case .error: msg = "Unlock error (empty password?)"
+                }
+                self?.videoView?.showStatus(msg, hideAfter: 5)
+            }
+        }
+
+        streamer.onLockState = { [weak view] isLocked in
+            DispatchQueue.main.async {
+                view?.showStatus(isLocked ? "Remote screen locked" : "Remote screen unlocked")
+            }
+        }
+
         let sender = InputSender(streamer: streamer, view: view)
         sender.onCycleDisplay = { [weak streamer] in
             streamer?.sendSwitchDisplay(index: 255)
+        }
+        sender.onUnlockRequest = { [weak self] in
+            DispatchQueue.main.async {
+                self?.promptUnlockPassword()
+            }
         }
         sender.install(onQuit: { NSApp.terminate(nil) })
         inputSender = sender
@@ -117,6 +142,21 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
                 print("No video for \(Int(elapsed))s — reconnecting (sending hello...)")
             }
         }
+    }
+
+    private func promptUnlockPassword() {
+        let alert = NSAlert()
+        alert.messageText = "Unlock remote screen"
+        alert.informativeText = "Enter the login password of the remote Mac. It is sent over UDP (unencrypted) and typed into its lock screen."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Unlock")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return }
+        videoView?.showStatus("Unlocking...", hideAfter: nil)
+        streamer?.sendUnlock(password: field.stringValue)
     }
 
     func applicationWillTerminate(_ notification: Notification) {

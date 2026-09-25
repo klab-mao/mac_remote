@@ -50,13 +50,21 @@ final class VideoView: NSView {
     }
 
     func showDisplayInfo(current: Int, total: Int) {
-        infoLabel.stringValue = "Display \(current + 1) / \(total)"
+        showStatus("Display \(current + 1) / \(total)")
+    }
+
+    /// Show a transient status message centered over the video.
+    /// Pass hideAfter: nil to keep the message until the next one replaces it.
+    func showStatus(_ text: String, hideAfter: TimeInterval? = 2.5) {
+        infoLabel.stringValue = text
         infoLabel.sizeToFit()
         needsLayout = true
         infoLabel.isHidden = false
         infoHideTimer?.invalidate()
-        infoHideTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { [weak self] _ in
-            self?.infoLabel.isHidden = true
+        if let hideAfter {
+            infoHideTimer = Timer.scheduledTimer(withTimeInterval: hideAfter, repeats: false) { [weak self] _ in
+                self?.infoLabel.isHidden = true
+            }
         }
     }
 
@@ -95,6 +103,7 @@ final class InputSender {
     private var monitors: [Any] = []
     private var captureDebugCount = 0
     var onCycleDisplay: (() -> Void)?
+    var onUnlockRequest: (() -> Void)?
 
     init(streamer: Streamer, view: VideoView) {
         self.streamer = streamer
@@ -132,6 +141,13 @@ final class InputSender {
                event.modifierFlags.contains(.command) && event.modifierFlags.contains(.shift),
                let ch = event.charactersIgnoringModifiers, ch.lowercased() == "d" {
                 self.onCycleDisplay?()
+                return nil
+            }
+
+            if event.type == .keyDown,
+               event.modifierFlags.contains(.command) && event.modifierFlags.contains(.shift),
+               let ch = event.charactersIgnoringModifiers, ch.lowercased() == "u" {
+                self.onUnlockRequest?()
                 return nil
             }
 
