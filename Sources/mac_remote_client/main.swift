@@ -52,11 +52,12 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
             self.frameCount += 1
             let layer = view.displayLayer
             DispatchQueue.main.async {
-                layer.enqueue(sampleBuffer)
                 if layer.status == .failed {
+                    print("displayLayer FAILED, flushing + requesting keyframe")
                     layer.flush()
                     self.streamer?.requestKeyframe()
                 }
+                layer.enqueue(sampleBuffer)
             }
         }
 
@@ -83,6 +84,7 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
         streamer.start()
         self.streamer = streamer
 
+        win.level = .floating
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         win.makeKey()
@@ -137,5 +139,5 @@ guard let cfg = clientConfig else {
 let app = NSApplication.shared
 let delegate = ClientDelegate(host: cfg.host, port: cfg.port)
 app.delegate = delegate
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
 app.run()

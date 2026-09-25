@@ -62,9 +62,16 @@ final class VideoView: NSView {
 
     func normalizedPoint(for event: NSEvent) -> (nx: Float, ny: Float)? {
         let local = convert(event.locationInWindow, from: nil)
-        let vw = bounds.width
-        let vh = bounds.height
-        guard vw > 0, vh > 0, remoteSize.width > 0, remoteSize.height > 0 else { return nil }
+        var vw = bounds.width
+        var vh = bounds.height
+        if vw <= 0 || vh <= 0, let win = window {
+            vw = win.contentView?.frame.width ?? 0
+            vh = win.contentView?.frame.height ?? 0
+        }
+        guard vw > 0, vh > 0, remoteSize.width > 0, remoteSize.height > 0 else {
+            print("normalizedPoint nil: bounds=\(bounds.size) winFrame=\(window?.frame.size ?? .zero) remoteSize=\(remoteSize) locInWin=\(event.locationInWindow)")
+            return nil
+        }
         let scale = min(vw / remoteSize.width, vh / remoteSize.height)
         let dw = remoteSize.width * scale
         let dh = remoteSize.height * scale
@@ -103,9 +110,15 @@ final class InputSender {
         ]
         let monitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
             guard let self else { return event }
+
+            if event.type == .leftMouseDown, self.captureDebugCount == 0 {
+                let ourWin = self.view.window
+                print("monitor saw leftMouseDown: event.window=\(String(describing: event.window)) ourWindow=\(String(describing: ourWin)) match=\(ourWin === event.window) isKey=\(event.window?.isKeyWindow ?? false)")
+            }
+
             guard let window = event.window, window === self.view.window, window.isKeyWindow else {
                 if self.captureDebugCount == 0, event.type == .leftMouseDown {
-                    print("input monitor: event not for our key window (window=\(String(describing: event.window?.isKeyWindow))) — not sending")
+                    print("input monitor: event not for our key window — not sending")
                 }
                 return event
             }
