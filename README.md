@@ -101,6 +101,25 @@ Available displays: 2
   [1] id=1 2560x1440 origin=(2560,0)
 ```
 
+### Run the host as a service (launchd)
+
+`scripts/install_service.sh` installs the host as a **per-user LaunchAgent** that starts at login and is restarted on crash. A system LaunchDaemon would not work: ScreenCaptureKit can only capture from a logged-in GUI session, and TCC permissions (Screen Recording / Accessibility) are granted per user.
+
+```sh
+scripts/install_service.sh [--port 42420] [--fps 60] [--bitrate 25] [--display 0] [--client-timeout 10] [--binary PATH]
+```
+
+It builds a universal Release binary if none exists, copies it to `~/Library/Application Support/mac_remote/bin/mac_remote_host`, writes `~/Library/LaunchAgents/com.mac_remote.host.plist`, and loads it. Re-running replaces the service with the new settings. Log: `~/Library/Application Support/mac_remote/host.log`.
+
+```sh
+launchctl list com.mac_remote.host                           # status
+launchctl kickstart -k gui/$(id -u)/com.mac_remote.host      # restart
+tail -f "$HOME/Library/Application Support/mac_remote/host.log"
+scripts/uninstall_service.sh                                 # stop + remove everything
+```
+
+TCC permissions are bound to the binary **path**: after installing, grant Screen Recording and Accessibility to the installed copy (`~/Library/Application Support/mac_remote/bin/mac_remote_host`) — not the build output — then restart the service and check the log for `permission: GRANTED`.
+
 ### Client (the Mac viewing/controlling)
 
 ```sh
