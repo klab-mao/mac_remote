@@ -37,7 +37,7 @@ enum ScreenLock {
         // Wake via IOKit power assertion
         var assertionID: IOPMAssertionID = 0
         IOPMAssertionCreateWithName(
-            kIOPMAssertionTypeUserIsActive as CFString,
+            "UserIsActive" as CFString,
             IOPMAssertionLevel(kIOPMAssertionLevelOn),
             "mac_remote unlock wake" as CFString,
             &assertionID
@@ -46,8 +46,9 @@ enum ScreenLock {
         DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
             IOPMAssertionRelease(assertionID)
         }
-        // Also nudge with a null/hid event — posting any event counts as user activity.
-        if let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGEventSource.location(.cghidEventTap), mouseButton: .left) {
+        // Also nudge with a mouse-move event — posting any event counts as user activity.
+        let position = CGEvent(source: nil)?.location ?? .zero
+        if let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: position, mouseButton: .left) {
             move.post(tap: .cghidEventTap)
         }
     }

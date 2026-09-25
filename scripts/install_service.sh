@@ -126,8 +126,11 @@ if [ -z "$SRC_BIN" ]; then
 fi
 
 if [ -z "$SRC_BIN" ]; then
-    echo "==> No prebuilt binary found — building universal Release binary"
-    (cd "$repo_root" && swift build -c release --arch arm64 --arch x86_64)
+    echo "==> No prebuilt binary found — building universal (arm64+x86_64) Release binary"
+    if ! (cd "$repo_root" && swift build -c release --arch arm64 --arch x86_64); then
+        echo "==> Universal build failed (it needs full Xcode) — building native-arch Release binary" >&2
+        (cd "$repo_root" && swift build -c release)
+    fi
     SRC_BIN="$(find_built_binary || true)"
 fi
 

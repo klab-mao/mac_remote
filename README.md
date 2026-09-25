@@ -59,7 +59,9 @@ swift build --arch arm64 --arch x86_64
 
 Produces a **universal (fat) binary** so the same executables run on both Apple Silicon and Intel Macs. The x86_64 slice targets macOS 13 (Ventura) minimum.
 
-> Plain `swift build` produces an arm64-only binary — Intel Macs reject it with `bad CPU type in executable`. Always use `--arch arm64 --arch x86_64`.
+> Plain `swift build` on Apple Silicon produces an arm64-only binary — Intel Macs reject it with `bad CPU type in executable`. Always use `--arch arm64 --arch x86_64`.
+>
+> Universal builds require full Xcode (multi-arch builds go through `xcbuild`). With only Command Line Tools installed, `--arch` builds fail — build for the native architecture instead: `swift build -c release`.
 
 Binaries land in `.build/out/Products/Debug/`.
 
@@ -109,7 +111,7 @@ Available displays: 2
 scripts/install_service.sh [--port 42420] [--fps 60] [--bitrate 25] [--display 0] [--client-timeout 10] [--binary PATH]
 ```
 
-It builds a universal Release binary if none exists, copies it to `~/Library/Application Support/mac_remote/bin/mac_remote_host`, writes `~/Library/LaunchAgents/com.mac_remote.host.plist`, and loads it. Re-running replaces the service with the new settings. Log: `~/Library/Application Support/mac_remote/host.log`.
+It builds a universal Release binary if none exists (falling back to a native-arch Release build on machines with only Command Line Tools, where universal builds are unavailable), copies it to `~/Library/Application Support/mac_remote/bin/mac_remote_host`, writes `~/Library/LaunchAgents/com.mac_remote.host.plist`, and loads it. Re-running replaces the service with the new settings. Log: `~/Library/Application Support/mac_remote/host.log`.
 
 ```sh
 launchctl list com.mac_remote.host                           # status
