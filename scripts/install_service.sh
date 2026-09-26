@@ -1,5 +1,5 @@
 #!/bin/bash
-# install_service.sh — install mac_remote_host as a macOS launchd service.
+# install_service.sh — install or upgrade mac_remote_host as a macOS launchd service.
 #
 # Installs a per-user LaunchAgent (not a system LaunchDaemon) on purpose:
 # ScreenCaptureKit can only capture the screen from inside a logged-in GUI
@@ -11,7 +11,11 @@
 #   scripts/install_service.sh [--port N] [--fps N] [--bitrate N]
 #                              [--display N] [--client-timeout S] [--binary PATH]
 #
-# Re-running the script replaces the existing service with the new settings.
+# If the service is already installed, the script runs in **upgrade** mode:
+#   - Settings not specified on the command line are preserved from the existing plist.
+#   - The binary is rebuilt (or the --binary path is used) and replaced.
+#   - The service is restarted with the merged settings.
+# If no service exists, it runs in **install** mode with defaults or provided flags.
 # Remove everything with scripts/uninstall_service.sh.
 
 set -euo pipefail
@@ -25,11 +29,11 @@ PLIST="$PLIST_DIR/$LABEL.plist"
 LOG_FILE="$INSTALL_DIR/host.log"
 LAUNCH_DOMAIN="gui/$(id -u)"
 
-PORT=42420
-FPS=60
-BITRATE=25
-DISPLAY=0
-CLIENT_TIMEOUT=10
+PORT=""
+FPS=""
+BITRATE=""
+DISPLAY=""
+CLIENT_TIMEOUT=""
 BINARY=""
 
 usage() {
@@ -43,6 +47,10 @@ flags (same meaning as mac_remote_host's own flags):
   --display N         initial display index       (default 0)
   --client-timeout S  client inactivity timeout   (default 10)
   --binary PATH       use this prebuilt mac_remote_host instead of building
+
+When upgrading an existing installation, flags not specified on the command
+line are preserved from the current plist. When installing fresh, defaults
+shown above are used.
 
 environment:
   MAC_REMOTE_INSTALL_DIR  where the binary and logs are installed
@@ -76,6 +84,33 @@ if [ "$(id -u)" -eq 0 ]; then
     echo "error: do not run with sudo — this installs a per-user LaunchAgent" >&2
     exit 1
 fi
+
+# ---- detect install vs upgrade -----------------------------------------------
+
+UPGRADE=false
+if [ -f "$PLIST" ]; then
+    UPGRADE=true
+    echo "==> Upgrade detected — existing plist found at $PLIST"
+    echo "    Preserving settings not explicitly overridden:"
+    read_plist_val() {
+        plutil -extract "ProgramArguments.$1" raw "$PLIST" 2>/dev/null || echo ""
+    }
+    [ -z "$PORT" ]           && PORT="$(read_plist_val 2)"           && [ -n "$PORT" ]           && echo "    --port $PORT"
+    [ -z "$FPS" ]            && FPS="$(read_plist_val 4)"            && [ -n "$FPS" ]            && echo "    --fps $FPS"
+    [ -z "$BITRATE" ]        && BITRATE="$(read_plist_val 6)"        && [ -n "$BITRATE" ]        && echo "    --bitrate $BITRATE"
+    [ -z "$DISPLAY" ]        && DISPLAY="$(read_plist_val 8)"        && [ -n "$DISPLAY" ]        && echo "    --display $DISPLAY"
+    [ -z "$CLIENT_TIMEOUT" ] && CLIENT_TIMEOUT="$(read_plist_val 10)" && [ -n "$CLIENT_TIMEOUT" ] && echo "    --client-timeout $CLIENT_TIMEOUT"
+else
+    echo "==> Fresh install — no existing plist found"
+fi
+
+# ---- fill defaults for anything still unset ----------------------------------
+
+[ -z "$PORT" ]           && PORT=42420
+[ -z "$FPS" ]            && FPS=60
+[ -z "$BITRATE" ]        && BITRATE=25
+[ -z "$DISPLAY" ]        && DISPLAY=0
+[ -z "$CLIENT_TIMEOUT" ] && CLIENT_TIMEOUT=10
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -201,7 +236,11 @@ launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST"
 launchctl enable "$LAUNCH_DOMAIN/$LABEL"
 
 echo
-echo "Installed:  $LABEL  (starts at login, restarts on crash)"
+if [ "$UPGRADE" = true ]; then
+    echo "Upgraded:  $LABEL  (starts at login, restarts on crash)"
+else
+    echo "Installed:  $LABEL  (starts at login, restarts on crash)"
+fi
 echo "Binary:     $BIN_PATH"
 echo "Log:        $LOG_FILE"
 echo
@@ -210,10 +249,16 @@ echo "  restart:  launchctl kickstart -k $LAUNCH_DOMAIN/$LABEL"
 echo "  stop   :  launchctl bootout $LAUNCH_DOMAIN \"$PLIST\""
 echo "  logs   :  tail -f \"$LOG_FILE\""
 echo
-echo "IMPORTANT — permissions are granted per binary path. If not already granted"
-echo "for the installed copy:"
-echo "  1. System Settings > Privacy & Security > Screen Recording -> add $BIN_PATH"
-echo "  2. System Settings > Privacy & Security > Accessibility    -> add $BIN_PATH"
-echo "  3. launchctl kickstart -k $LAUNCH_DOMAIN/$LABEL"
-echo "The log then prints 'Screen Recording permission: GRANTED' and"
-echo "'Accessibility permission: GRANTED'."
+if [ "$UPGRADE" = true ]; then
+    echo "Binary updated — permissions are already granted for this path."
+    echo "If the host was reinstalled to a different path, re-grant in"
+    echo "System Settings > Privacy & Security > Screen Recording / Accessibility."
+else
+    echo "IMPORTANT — permissions are granted per binary path. If not already granted"
+    echo "for the installed copy:"
+    echo "  1. System Settings > Privacy & Security > Screen Recording -> add $BIN_PATH"
+    echo "  2. System Settings > Privacy & Security > Accessibility    -> add $BIN_PATH"
+    echo "  3. launchctl kickstart -k $LAUNCH_DOMAIN/$LABEL"
+    echo "The log then prints 'Screen Recording permission: GRANTED' and"
+    echo "'Accessibility permission: GRANTED'."
+fi
