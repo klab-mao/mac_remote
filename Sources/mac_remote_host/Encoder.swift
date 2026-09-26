@@ -106,9 +106,6 @@ final class H264Encoder {
     fileprivate func handleOutput(status: OSStatus, infoFlags: VTEncodeInfoFlags, sampleBuffer: CMSampleBuffer?) {
         guard status == noErr, let sb = sampleBuffer, CMSampleBufferDataIsReady(sb) else { return }
 
-        let notSync = CMGetAttachment(sb, key: kCMSampleAttachmentKey_NotSync, attachmentModeOut: nil) as? Bool ?? false
-        let isKeyframe = !notSync
-
         guard let formatDesc = CMSampleBufferGetFormatDescription(sb) else { return }
 
         var spsPtr: UnsafePointer<UInt8>?
@@ -132,21 +129,35 @@ final class H264Encoder {
         let spsData = Data(bytes: sps, count: spsSize)
         let ppsData = Data(bytes: pps, count: ppsSize)
 
-        lock.lock()
-        let paramsChanged = cachedSPS != spsData || cachedPPS != ppsData
-        if isKeyframe || paramsChanged {
-            cachedSPS = spsData
-            cachedPPS = ppsData
-        }
-        lock.unlock()
-
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sb) else { return }
         let length = CMBlockBufferGetDataLength(blockBuffer)
         var bytes = [UInt8](repeating: 0, count: length)
         let copyStatus = CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: &bytes)
         guard copyStatus == noErr else { return }
 
+        let isKeyframe = Self.detectIDR(bytes)
+        if isKeyframe {
+            lock.lock()
+            cachedSPS = spsData
+            cachedPPS = ppsData
+            lock.unlock()
+        }
+
         onEncodedFrame?(Data(bytes), isKeyframe, spsData, ppsData)
+    }
+
+    static func detectIDR(_ bytes: [UInt8]) -> Bool {
+        var offset = 0
+        while offset + 4 <= bytes.count {
+            let nalLen = Int(bytes[offset]) << 24 | Int(bytes[offset + 1]) << 16
+                | Int(bytes[offset + 2]) << 8 | Int(bytes[offset + 3])
+            guard nalLen > 0, offset + 4 + nalLen <= bytes.count else { break }
+            let nalType = bytes[offset + 4] & 0x1F
+            if nalType == 5 { return true }
+            if nalType == 1 { return false }
+            offset += 4 + nalLen
+        }
+        return false
     }
 
     enum EncoderError: Error {

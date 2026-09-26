@@ -12,42 +12,51 @@ final class Streamer {
     var onUnlockResult: ((UnlockResultCode) -> Void)?
     var onLockState: ((Bool) -> Void)?
 
-    private let flow: UDPFlow
+    private let transport: Transport
     private let assembler = FrameAssembler()
     private var format: CMVideoFormatDescription?
     private var receivedFirstFrame = false
+    private var lastSPS: Data?
+    private var lastPPS: Data?
+    private let formatLock = NSLock()
+    private var pingTimer: Timer?
 
-    init(flow: UDPFlow) {
-        self.flow = flow
-        flow.onPacket = { [weak self] header, payload in
+    init(transport: Transport) {
+        self.transport = transport
+        transport.onPacket = { [weak self] header, payload in
             self?.handle(header: header, payload: payload)
         }
     }
 
     func start() {
-        flow.start()
-        flow.sendControl(.hello)
+        transport.start()
+        transport.sendControl(.hello)
+        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.transport.sendControl(.ping)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        pingTimer = timer
     }
 
     func sendInput(_ packet: InputPacket) {
-        flow.send(type: .input, payload: packet.encode())
+        transport.send(type: .input, payload: packet.encode())
     }
 
     func requestKeyframe() {
-        flow.sendControl(.keyframeRequest)
+        transport.sendControl(.keyframeRequest)
     }
 
     func sendHelloAndKeyframe() {
-        flow.sendControl(.hello)
-        flow.sendControl(.keyframeRequest)
+        transport.sendControl(.hello)
+        transport.sendControl(.keyframeRequest)
     }
 
     func sendSwitchDisplay(index: UInt8) {
-        flow.sendDatagram(Packetizer.controlPacket(.switchDisplay, extra: Data([index])))
+        transport.sendDatagram(Packetizer.controlPacket(.switchDisplay, extra: Data([index])))
     }
 
     func sendUnlock(password: String) {
-        flow.sendControl(.unlockRequest, extra: Data(password.utf8))
+        transport.sendControl(.unlockRequest, extra: Data(password.utf8))
     }
 
     private func handle(header: PacketHeader, payload: Data) {
@@ -65,14 +74,7 @@ final class Streamer {
         guard let subType = ControlSubType(rawValue: payload.first ?? 255) else { return }
         switch subType {
         case .params:
-            guard payload.count > 3 else { return }
-            let spsLen = Int(payload[1])
-            guard payload.count > 2 + spsLen else { return }
-            let sps = payload.subdata(in: 2..<(2 + spsLen))
-            let ppsLen = Int(payload[2 + spsLen])
-            guard payload.count >= 3 + spsLen + ppsLen else { return }
-            let pps = payload.subdata(in: (3 + spsLen)..<(3 + spsLen + ppsLen))
-            updateFormat(sps: sps, pps: pps)
+            parseParams(payload)
         case .displayInfo:
             guard payload.count >= 3 else { return }
             onDisplayInfo?(Int(payload[1]), Int(payload[2]))
@@ -85,6 +87,27 @@ final class Streamer {
         default:
             break
         }
+    }
+
+    private func parseParams(_ payload: Data) {
+        guard payload.count > 3 else { return }
+        let spsLen = Int(payload[1])
+        guard payload.count > 2 + spsLen else { return }
+        let sps = payload.subdata(in: 2..<(2 + spsLen))
+        let ppsLen = Int(payload[2 + spsLen])
+        guard payload.count >= 3 + spsLen + ppsLen else { return }
+        let pps = payload.subdata(in: (3 + spsLen)..<(3 + spsLen + ppsLen))
+
+        formatLock.lock()
+        let unchanged = lastSPS == sps && lastPPS == pps && format != nil
+        lastSPS = sps
+        lastPPS = pps
+        formatLock.unlock()
+        if unchanged {
+            Log.v("params unchanged, skipping format rebuild")
+            return
+        }
+        updateFormat(sps: sps, pps: pps)
     }
 
     private func updateFormat(sps: Data, pps: Data) {
@@ -113,19 +136,24 @@ final class Streamer {
             print("Failed to create format description")
             return
         }
+        formatLock.lock()
         format = fmt
+        formatLock.unlock()
         let dims = CMVideoFormatDescriptionGetDimensions(fmt)
         onRemoteSize?(CGSize(width: CGFloat(dims.width), height: CGFloat(dims.height)))
         print("Format ready: \(dims.width)x\(dims.height)")
     }
 
     private func handleVideo(header: PacketHeader, payload: Data) {
-        guard format != nil else {
+        formatLock.lock()
+        let fmt = format
+        formatLock.unlock()
+        guard let format = fmt else {
             requestKeyframe()
             return
         }
         guard let avcc = assembler.push(header: header, payload: payload) else { return }
-        guard let sampleBuffer = SampleBufferFactory.makeSampleBuffer(avcc, format: format!, frameId: header.frameId) else {
+        guard let sampleBuffer = SampleBufferFactory.makeSampleBuffer(avcc, format: format, frameId: header.frameId) else {
             return
         }
         if !receivedFirstFrame {
@@ -143,21 +171,29 @@ final class FrameAssembler {
     }
 
     private var frames: [UInt32: AssemblingFrame] = [:]
-    private var oldestIncomplete: UInt32 = 0
+    private var highestSeen: UInt32 = 0
+    private let lock = NSLock()
 
     func push(header: PacketHeader, payload: Data) -> Data? {
-        if header.frameId > oldestIncomplete + 512 {
-            for (id, _) in frames where id < header.frameId - 512 {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if header.frameId > highestSeen {
+            highestSeen = header.frameId
+            for (id, _) in frames where id < highestSeen &- 32 {
                 frames.removeValue(forKey: id)
             }
-            oldestIncomplete = header.frameId
+        } else if highestSeen &- header.frameId > 256 {
+            return nil
         }
+
         var frame = frames[header.frameId] ?? AssemblingFrame(fragCount: header.fragCount, parts: [:])
         frame.parts[header.fragIndex] = payload
         frames[header.frameId] = frame
 
         guard frame.parts.count == Int(frame.fragCount) else { return nil }
         var data = Data()
+        data.reserveCapacity(Int(header.fragCount) * Packetizer.maxPayloadSize)
         for i in 0..<frame.fragCount {
             guard let part = frame.parts[i] else {
                 frames.removeValue(forKey: header.frameId)

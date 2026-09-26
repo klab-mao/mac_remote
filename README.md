@@ -2,6 +2,10 @@
 
 Internal-use macOS screen sharing tool (macOS-to-macOS), built as a replacement for the slow built-in Screen Sharing (VNC). Goal: TeamViewer-level smoothness with visually lossless image quality.
 
+**Two connection modes:**
+- **LAN mode** — direct UDP between Macs on the same network (lowest latency).
+- **Relay mode** — both sides connect outbound to your own cloud server (`relayd`, Go), bridging two intranets across NAT, with per-user login accounts configured server-side. See [docs/RELAY.md](docs/RELAY.md).
+
 ## Architecture
 
 ```
@@ -38,8 +42,9 @@ mac_remote/
   Package.swift                    Swift package (platforms: macOS 13+)
   Sources/
     MacRemoteCore/                 Shared library
-      Protocol.swift               Packet header, types, InputPacket, Packetizer
+      Protocol.swift               Packet header, types, InputPacket, Packetizer, Transport
       Transport.swift              UDPFlow (NWConnection), UDPListener (NWListener)
+      RelayClient.swift            RelayTransport: TCP auth (HMAC challenge) + UDP relay data plane
     mac_remote_host/               Host executable (the controlled Mac)
       main.swift                   HostEngine: lifecycle, flow handling, arg parsing
       Capture.swift                CaptureEngine: SCStream multi-display + switching
@@ -49,12 +54,20 @@ mac_remote/
       main.swift                   ClientDelegate: window, streamer, timers
       Streamer.swift               Frame reassembly, sample buffer creation, decode
       InputSender.swift            VideoView, BorderlessWindow, NSEvent monitor
+  relayd/                          Cloud relay server (Go) — bridges two intranets
+    main.go                        Flags, accounts loading, startup
+    control.go                     TCP control: HMAC challenge-response, sessions
+    udp.go                         UDP data plane: session bind + bidirectional forwarding
+    control_test.go                Integration tests: auth, sessions, forwarding
+  docs/RELAY.md                    Relay deployment guide + protocol reference
 ```
 
 ## Build
 
 ```sh
-swift build --arch arm64 --arch x86_64
+swift build --arch arm64 --arch x86_64   # host + client (universal)
+cd relayd && go build -o relayd .        # relay server (any Linux)
+go test ./...                            # relay server tests
 ```
 
 Produces a **universal (fat) binary** so the same executables run on both Apple Silicon and Intel Macs. The x86_64 slice targets macOS 13 (Ventura) minimum.
@@ -90,11 +103,21 @@ Accessibility permission: GRANTED
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | 42420 | UDP port |
+| `--port` | 42420 | UDP port (LAN mode only) |
 | `--fps` | 60 | capture/encode framerate |
 | `--bitrate` | 25 | H.264 bitrate in Mbps (use 40-80 on LAN for near-lossless text) |
 | `--display` | 0 | initial display index (use `--display 1` for second monitor) |
-| `--client-timeout` | 10 | seconds without client packets before stopping video (0 = never timeout) |
+| `--client-timeout` | 10 | seconds without client packets before pausing video |
+| `--relay R:42430` | — | connect to relayd instead of LAN listening |
+| `--device-id` | — | device name registered on the relay (required with `--relay`) |
+| `--password` | — | device account password (prompted or `$MAC_REMOTE_PASSWORD` if omitted) |
+| `--debug` | — | verbose logging |
+
+Relay mode example (see [docs/RELAY.md](docs/RELAY.md) for server setup):
+
+```sh
+mac_remote_host --relay relay.example.com:42430 --device-id office-mac
+```
 
 The host enumerates all displays at startup and prints them:
 ```
@@ -124,9 +147,19 @@ TCC permissions are bound to the binary **path**: after installing, grant Screen
 
 ### Client (the Mac viewing/controlling)
 
+LAN mode:
+
 ```sh
-.build/out/Products/Debug/mac_remote_client <host-ip> [--port 42420]
+.build/out/Products/Debug/mac_remote_client <host-ip> [--port 42420] [--debug]
 ```
+
+Relay mode (login against server-side accounts, then connect to a registered device):
+
+```sh
+.build/out/Products/Debug/mac_remote_client --relay relay.example.com:42430 --user alice --device-id office-mac
+```
+
+Password is prompted with echo disabled (`--password` or `$MAC_REMOTE_PASSWORD` for non-interactive use).
 
 The client opens a borderless fullscreen window (level: floating, activation policy: regular). Mouse, scroll wheel, keyboard (with modifiers), and drag events are forwarded to the host.
 
@@ -261,16 +294,17 @@ The host only captures and sends **one display at a time** — the one the clien
 
 ## Known issues
 
-- **Video may stall after initial frames** — `AVSampleBufferDisplayLayer` can fail after a few frames, possibly due to large keyframe fragment loss on UDP or sample buffer timing. The client detects `.failed` status, flushes, and requests a keyframe. Under investigation.
-- **Single viewer at a time** — latest `hello` wins; a second client replaces the first.
+- **Video stream data is not encrypted** — in relay mode it crosses the public internet between the intranets and the relay. Wrap in WireGuard for sensitive use (see docs/RELAY.md security notes).
+- **Single viewer at a time** — latest session wins; a second client replaces the first.
 - **No retransmission/FEC** — on lossy Wi-Fi, frames may drop until the next keyframe (2s interval). On a clean LAN with high `--bitrate`, loss is rare.
 - **Remote cursor drawn into video** — the host's physical cursor is captured in the frame; the local cursor is hidden over the client window.
 - **No audio streaming, no clipboard sync, no file transfer.**
 
 ## Roadmap
 
-- Fix video stalling — investigate `AVSampleBufferDisplayLayer` failure cause; consider FEC for large keyframes.
-- Adaptive bitrate based on packet loss / RTT (ping packet type reserved in protocol).
+- End-to-end encryption (DTLS/QUIC) for relay mode.
+- P2P hole punching through the relay (direct path when NAT allows, relay as fallback).
+- Adaptive bitrate based on packet loss / RTT.
 - HEVC/AV1 encode option (VideoToolbox supports both on Apple Silicon).
 - Clipboard sync channel.
 - Pause capture engine (not just skip send) when client times out, to save CPU.

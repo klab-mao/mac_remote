@@ -1,9 +1,9 @@
 import Foundation
 import Network
 
-public final class UDPFlow {
+public final class UDPFlow: Transport {
     public var onPacket: ((PacketHeader, Data) -> Void)?
-    public var onState: ((NWConnection.State) -> Void)?
+    public var onState: ((String) -> Void)?
 
     private let connection: NWConnection
     private let queue: DispatchQueue
@@ -21,7 +21,11 @@ public final class UDPFlow {
 
     public func start() {
         connection.stateUpdateHandler = { [weak self] state in
-            self?.onState?(state)
+            if case .failed(let error) = state {
+                self?.onState?("failed: \(error)")
+            } else if case .ready = state {
+                self?.onState?("ready")
+            }
         }
         connection.start(queue: queue)
         scheduleReceive()
@@ -39,27 +43,17 @@ public final class UDPFlow {
             if error == nil {
                 self.scheduleReceive()
             } else {
-                print("UDP receive error: \(error!)")
+                self.onState?("receive error: \(error!)")
             }
         }
     }
 
     public func sendDatagram(_ data: Data) {
         connection.send(content: data, completion: .contentProcessed { error in
-            if let error { print("UDP send error: \(error)") }
+            if let error { Log.v("UDP send error: \(error)") }
         })
     }
 
-    public func send(type: PacketType, flags: UInt8 = 0, frameId: UInt32 = 0, fragIndex: UInt16 = 0, fragCount: UInt16 = 1, payload: Data) {
-        let header = PacketHeader(type: type, flags: flags, frameId: frameId, fragIndex: fragIndex, fragCount: fragCount, payloadLength: UInt32(payload.count))
-        var d = header.encode()
-        d.append(payload)
-        sendDatagram(d)
-    }
-
-    public func sendControl(_ subType: ControlSubType, extra: Data = Data()) {
-        sendDatagram(Packetizer.controlPacket(subType, extra: extra))
-    }
 }
 
 public final class UDPListener {

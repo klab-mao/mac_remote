@@ -5,8 +5,8 @@ import Foundation
 import MacRemoteCore
 
 final class ClientDelegate: NSObject, NSApplicationDelegate {
-    private let host: String
-    private let port: UInt16
+    private let transport: Transport
+    private let modeLabel: String
 
     private var window: BorderlessWindow?
     private var videoView: VideoView?
@@ -19,15 +19,14 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
     private var lastFrameTime = Date()
     private var isReconnecting = false
 
-    init(host: String, port: UInt16) {
-        self.host = host
-        self.port = port
+    init(transport: Transport, modeLabel: String) {
+        self.transport = transport
+        self.modeLabel = modeLabel
         super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let flow = UDPFlow(host: host, port: port)
-        let streamer = Streamer(flow: flow)
+        let streamer = Streamer(transport: transport)
 
         let screenFrame = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
         let win = BorderlessWindow(
@@ -131,15 +130,18 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let fps = self.frameCount
             self.frameCount = 0
-            print("fps: \(fps)")
+            Log.v("fps: \(fps)")
         }
 
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             let elapsed = Date().timeIntervalSince(self.lastFrameTime)
-            if elapsed > 5 && !self.isReconnecting {
-                self.isReconnecting = true
-                print("No video for \(Int(elapsed))s — reconnecting (sending hello...)")
+            if elapsed > 5 {
+                if !self.isReconnecting {
+                    self.isReconnecting = true
+                    print("No video for \(Int(elapsed))s — requesting keyframe...")
+                }
+                self.streamer?.sendHelloAndKeyframe()
             }
         }
     }
@@ -164,17 +166,46 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+struct ClientConfig {
+    var transport: Transport
+    var modeLabel: String
+    var debug: Bool
+}
 
-func parseClientArgs() -> (host: String, port: UInt16)? {
+func parseClientArgs() -> ClientConfig? {
     let args = CommandLine.arguments
     var host: String?
     var port: UInt16 = 42420
+    var relayHost: String?
+    var relayPort: UInt16 = 42430
+    var user: String?
+    var deviceId: String?
+    var password: String?
+    var debug = false
     var i = 1
     while i < args.count {
         switch args[i] {
         case "--port":
             if i + 1 < args.count { port = UInt16(args[i + 1]) ?? port }
             i += 1
+        case "--relay":
+            if i + 1 < args.count {
+                let parts = args[i + 1].split(separator: ":")
+                relayHost = String(parts[0])
+                if parts.count > 1 { relayPort = UInt16(parts[1]) ?? relayPort }
+            }
+            i += 1
+        case "--user":
+            if i + 1 < args.count { user = args[i + 1] }
+            i += 1
+        case "--device-id":
+            if i + 1 < args.count { deviceId = args[i + 1] }
+            i += 1
+        case "--password":
+            if i + 1 < args.count { password = args[i + 1] }
+            i += 1
+        case "--debug":
+            debug = true
         default:
             if host == nil, !args[i].hasPrefix("--") {
                 host = args[i]
@@ -182,19 +213,44 @@ func parseClientArgs() -> (host: String, port: UInt16)? {
         }
         i += 1
     }
+
+    if let rh = relayHost {
+        guard let u = user, let id = deviceId else {
+            print("--user and --device-id are required with --relay")
+            return nil
+        }
+        var pass = password ?? ProcessInfo.processInfo.environment["MAC_REMOTE_PASSWORD"]
+        if pass == nil {
+            pass = SecureInput.readPassword(prompt: "Password for '\(u)': ")
+        }
+        let rt = RelayTransport(
+            host: rh,
+            controlPort: relayPort,
+            role: .viewer(username: u, deviceId: id),
+            secret: pass ?? ""
+        )
+        return ClientConfig(transport: rt, modeLabel: "relay \(rh):\(relayPort) as \(u) -> \(id)", debug: debug)
+    }
+
     guard let h = host else { return nil }
-    return (h, port)
+    let flow = UDPFlow(host: h, port: port)
+    return ClientConfig(transport: flow, modeLabel: "direct \(h):\(port)", debug: debug)
 }
 
 let clientConfig = parseClientArgs()
 
 guard let cfg = clientConfig else {
-    print("Usage: mac_remote_client <host> [--port N]")
+    print("Usage:")
+    print("  LAN:   mac_remote_client <host> [--port N] [--debug]")
+    print("  Relay: mac_remote_client --relay <relay-host>[:port] --user <name> --device-id <id> [--password pass] [--debug]")
     exit(2)
 }
 
+Log.verbose = cfg.debug
+print("Connecting via \(cfg.modeLabel)")
+
 let app = NSApplication.shared
-let delegate = ClientDelegate(host: cfg.host, port: cfg.port)
+let delegate = ClientDelegate(transport: cfg.transport, modeLabel: cfg.modeLabel)
 app.delegate = delegate
 app.setActivationPolicy(.regular)
 app.run()

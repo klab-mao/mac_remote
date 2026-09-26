@@ -16,6 +16,37 @@ public enum ControlSubType: UInt8 {
     case unlockRequest = 6
     case unlockResult = 7
     case lockState = 8
+    case ping = 9
+    case pong = 10
+}
+
+public enum Log {
+    public static var verbose = false
+
+    public static func v(_ text: String) {
+        guard verbose else { return }
+        print(text)
+    }
+}
+
+public protocol Transport: AnyObject {
+    var onPacket: ((PacketHeader, Data) -> Void)? { get set }
+    var onState: ((String) -> Void)? { get set }
+    func start()
+    func sendDatagram(_ data: Data)
+}
+
+extension Transport {
+    public func send(type: PacketType, flags: UInt8 = 0, frameId: UInt32 = 0, fragIndex: UInt16 = 0, fragCount: UInt16 = 1, payload: Data) {
+        let header = PacketHeader(type: type, flags: flags, frameId: frameId, fragIndex: fragIndex, fragCount: fragCount, payloadLength: UInt32(payload.count))
+        var d = header.encode()
+        d.append(payload)
+        sendDatagram(d)
+    }
+
+    public func sendControl(_ subType: ControlSubType, extra: Data = Data()) {
+        sendDatagram(Packetizer.controlPacket(subType, extra: extra))
+    }
 }
 
 public enum UnlockResultCode: UInt8 {
@@ -185,6 +216,12 @@ extension Data {
         append(UInt8((v >> 8) & 0xff))
         append(UInt8((v >> 16) & 0xff))
         append(UInt8((v >> 24) & 0xff))
+    }
+
+    mutating func appendLE(_ v: UInt64) {
+        for i in 0..<8 {
+            append(UInt8((v >> (8 * i)) & 0xff))
+        }
     }
 
     mutating func appendLE(_ v: Float) {
