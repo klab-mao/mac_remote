@@ -60,9 +60,10 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
             let layer = view.displayLayer
             DispatchQueue.main.async {
                 if layer.status == .failed {
-                    print("displayLayer FAILED, flushing + requesting keyframe")
+                    print("displayLayer FAILED, flushing + marking decoder failed")
                     layer.flush()
-                    self.streamer?.requestKeyframe()
+                    self.streamer?.markDecoderFailed()
+                    return
                 }
                 layer.enqueue(sampleBuffer)
             }

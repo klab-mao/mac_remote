@@ -40,6 +40,7 @@ BINARY=""
 RELAY=""
 DEVICE_ID=""
 PASSWORD=""
+CODEC=""
 
 usage() {
     cat <<'USAGE'
@@ -55,7 +56,8 @@ Relay mode flags:
 
 Common flags:
   --fps N             capture/encode framerate    (default 60)
-  --bitrate N         H.264 bitrate in Mbps       (default 25)
+  --bitrate N         bitrate in Mbps            (default 40)
+  --codec CODEC       h264 or hevc               (default h264)
   --display N         initial display index       (default 0)
   --client-timeout S  client inactivity timeout   (default 10)
   --binary PATH       use this prebuilt binary instead of building
@@ -73,7 +75,7 @@ USAGE
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --port|--fps|--bitrate|--display|--client-timeout|--binary|--relay|--device-id|--password)
+        --port|--fps|--bitrate|--display|--client-timeout|--binary|--relay|--device-id|--password|--codec)
             if [ $# -lt 2 ]; then
                 echo "error: $1 requires a value" >&2
                 exit 1
@@ -90,6 +92,7 @@ while [ $# -gt 0 ]; do
         --relay)           RELAY="$2" ;;
         --device-id)       DEVICE_ID="$2" ;;
         --password)        PASSWORD="$2" ;;
+        --codec)           CODEC="$2" ;;
         -h|--help)         usage; exit 0 ;;
         *) echo "error: unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -143,6 +146,7 @@ except: pass
     [ -z "$RELAY" ]          && RELAY="$(read_plist_flag --relay)"          && [ -n "$RELAY" ]          && echo "    --relay $RELAY"
     [ -z "$DEVICE_ID" ]      && DEVICE_ID="$(read_plist_flag --device-id)"      && [ -n "$DEVICE_ID" ]      && echo "    --device-id $DEVICE_ID"
     [ -z "$PASSWORD" ]       && PASSWORD="$(read_plist_flag --password)"       && [ -n "$PASSWORD" ]       && echo "    --password (preserved)"
+    [ -z "$CODEC" ]          && CODEC="$(read_plist_flag --codec)"             && [ -n "$CODEC" ]          && echo "    --codec $CODEC"
 else
     echo "==> Fresh install — no existing plist found"
 fi
@@ -150,7 +154,8 @@ fi
 # ---- fill defaults for anything still unset ----------------------------------
 
 [ -z "$FPS" ]            && FPS=60
-[ -z "$BITRATE" ]        && BITRATE=25
+[ -z "$BITRATE" ]        && BITRATE=40
+[ -z "$CODEC" ]          && CODEC=h264
 [ -z "$DISPLAY" ]        && DISPLAY=0
 [ -z "$CLIENT_TIMEOUT" ] && CLIENT_TIMEOUT=10
 # LAN mode default port (only used if not relay)
@@ -315,6 +320,8 @@ ARGS+="		<string>--fps</string>\n"
 ARGS+="		<string>$FPS</string>\n"
 ARGS+="		<string>--bitrate</string>\n"
 ARGS+="		<string>$BITRATE</string>\n"
+ARGS+="		<string>--codec</string>\n"
+ARGS+="		<string>$CODEC</string>\n"
 ARGS+="		<string>--display</string>\n"
 ARGS+="		<string>$DISPLAY</string>\n"
 ARGS+="		<string>--client-timeout</string>\n"

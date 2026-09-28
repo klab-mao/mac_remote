@@ -21,6 +21,11 @@ public enum ControlSubType: UInt8 {
     case setBitrate = 11
 }
 
+public enum CodecType: UInt8 {
+    case h264 = 0
+    case hevc = 1
+}
+
 public enum Log {
     public static var verbose = false
 

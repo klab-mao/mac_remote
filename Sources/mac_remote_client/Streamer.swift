@@ -16,14 +16,15 @@ final class Streamer {
     private let assembler = FrameAssembler()
     private var format: CMVideoFormatDescription?
     private var receivedFirstFrame = false
-    private var lastSPS: Data?
-    private var lastPPS: Data?
+    private var lastCodec: CodecType?
+    private var lastParamSets: [Data] = []
     private let formatLock = NSLock()
     private var pingTimer: Timer?
+    private var waitingForKeyframe = false
 
     // Adaptive bitrate state
-    private var maxBitrate: Int = 25
-    private var currentBitrate: Int = 25
+    private var maxBitrate: Int = 40
+    private var currentBitrate: Int = 40
     private var recentLossCount = 0
     private var recentTotalCount = 0
     private var lowLossStreak = 0
@@ -55,6 +56,12 @@ final class Streamer {
 
     func requestKeyframe() {
         transport.sendControl(.keyframeRequest)
+    }
+
+    func markDecoderFailed() {
+        waitingForKeyframe = true
+        requestKeyframe()
+        Log.v("decoder failed — waiting for keyframe, skipping P-frames")
     }
 
     func sendHelloAndKeyframe() {
@@ -102,47 +109,87 @@ final class Streamer {
 
     private func parseParams(_ payload: Data) {
         guard payload.count > 3 else { return }
-        let spsLen = Int(payload[1])
-        guard payload.count > 2 + spsLen else { return }
-        let sps = payload.subdata(in: 2..<(2 + spsLen))
-        let ppsLen = Int(payload[2 + spsLen])
-        guard payload.count >= 3 + spsLen + ppsLen else { return }
-        let pps = payload.subdata(in: (3 + spsLen)..<(3 + spsLen + ppsLen))
+        guard let codec = CodecType(rawValue: payload[1]) else { return }
+        let numParams = Int(payload[2])
+        var offset = 3
+        var paramSets: [Data] = []
+        for _ in 0..<numParams {
+            guard offset < payload.count else { return }
+            let len = Int(payload[offset])
+            offset += 1
+            guard offset + len <= payload.count else { return }
+            paramSets.append(payload.subdata(in: offset..<(offset + len)))
+            offset += len
+        }
+        guard paramSets.count == numParams else { return }
 
         formatLock.lock()
-        let unchanged = lastSPS == sps && lastPPS == pps && format != nil
-        lastSPS = sps
-        lastPPS = pps
+        let unchanged = lastCodec == codec && lastParamSets == paramSets && format != nil
+        lastCodec = codec
+        lastParamSets = paramSets
         formatLock.unlock()
         if unchanged {
             Log.v("params unchanged, skipping format rebuild")
             return
         }
-        updateFormat(sps: sps, pps: pps)
+        updateFormat(codec: codec, paramSets: paramSets)
     }
 
-    private func updateFormat(sps: Data, pps: Data) {
+    private func updateFormat(codec: CodecType, paramSets: [Data]) {
         var formatOut: CMVideoFormatDescription?
         var ok = false
-        sps.withUnsafeBytes { spsRaw in
-            pps.withUnsafeBytes { ppsRaw in
-                guard let spsBase = spsRaw.baseAddress, let ppsBase = ppsRaw.baseAddress else { return }
-                let pointers: [UnsafePointer<UInt8>] = [
-                    spsBase.assumingMemoryBound(to: UInt8.self),
-                    ppsBase.assumingMemoryBound(to: UInt8.self)
-                ]
-                let sizes = [sps.count, pps.count]
-                let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: kCFAllocatorDefault,
-                    parameterSetCount: 2,
-                    parameterSetPointers: pointers,
-                    parameterSetSizes: sizes,
-                    nalUnitHeaderLength: 4,
-                    formatDescriptionOut: &formatOut
-                )
-                ok = status == noErr
+
+        if codec == .hevc {
+            guard paramSets.count == 3 else { return }
+            paramSets[0].withUnsafeBytes { vpsRaw in
+                paramSets[1].withUnsafeBytes { spsRaw in
+                    paramSets[2].withUnsafeBytes { ppsRaw in
+                        guard let vpsBase = vpsRaw.baseAddress,
+                              let spsBase = spsRaw.baseAddress,
+                              let ppsBase = ppsRaw.baseAddress else { return }
+                        let pointers: [UnsafePointer<UInt8>] = [
+                            vpsBase.assumingMemoryBound(to: UInt8.self),
+                            spsBase.assumingMemoryBound(to: UInt8.self),
+                            ppsBase.assumingMemoryBound(to: UInt8.self)
+                        ]
+                        let sizes = [paramSets[0].count, paramSets[1].count, paramSets[2].count]
+                        let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                            allocator: kCFAllocatorDefault,
+                            parameterSetCount: 3,
+                            parameterSetPointers: pointers,
+                            parameterSetSizes: sizes,
+                            nalUnitHeaderLength: 4,
+                            extensions: nil,
+                            formatDescriptionOut: &formatOut
+                        )
+                        ok = status == noErr
+                    }
+                }
+            }
+        } else {
+            guard paramSets.count == 2 else { return }
+            paramSets[0].withUnsafeBytes { spsRaw in
+                paramSets[1].withUnsafeBytes { ppsRaw in
+                    guard let spsBase = spsRaw.baseAddress,
+                          let ppsBase = ppsRaw.baseAddress else { return }
+                    let pointers: [UnsafePointer<UInt8>] = [
+                        spsBase.assumingMemoryBound(to: UInt8.self),
+                        ppsBase.assumingMemoryBound(to: UInt8.self)
+                    ]
+                    let sizes = [paramSets[0].count, paramSets[1].count]
+                    let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                        allocator: kCFAllocatorDefault,
+                        parameterSetCount: 2,
+                        parameterSetPointers: pointers,
+                        parameterSetSizes: sizes,
+                        nalUnitHeaderLength: 4,
+                        formatDescriptionOut: &formatOut
+                    )
+                    ok = status == noErr
+                }
             }
         }
+
         guard ok, let fmt = formatOut else {
             print("Failed to create format description")
             return
@@ -152,10 +199,19 @@ final class Streamer {
         formatLock.unlock()
         let dims = CMVideoFormatDescriptionGetDimensions(fmt)
         onRemoteSize?(CGSize(width: CGFloat(dims.width), height: CGFloat(dims.height)))
-        print("Format ready: \(dims.width)x\(dims.height)")
+        print("Format ready: \(dims.width)x\(dims.height) \(codec == .hevc ? "HEVC" : "H.264")")
     }
 
     private func handleVideo(header: PacketHeader, payload: Data) {
+        let isKeyframe = (header.flags & 1) != 0
+        if waitingForKeyframe {
+            guard isKeyframe else {
+                Log.v("skipping P-frame while waiting for keyframe (frameId=\(header.frameId))")
+                return
+            }
+            waitingForKeyframe = false
+            Log.v("keyframe received, resuming decode (frameId=\(header.frameId))")
+        }
         formatLock.lock()
         let fmt = format
         formatLock.unlock()

@@ -30,7 +30,7 @@ Host: CGEvent.post(tap: .cghidEventTap)       Client: borderless fullscreen wind
 ### Key design choices
 
 - **ScreenCaptureKit** — GPU-accelerated capture at full retina resolution (macOS 12.3+). Zero-copy IOSurface pixel buffers passed directly to the encoder.
-- **VideoToolbox H.264** — Apple media engine hardware encode/decode. Configured for minimal latency: `RealTime=true`, `AllowFrameReordering=false`, `MaxFrameDelayCount=0`, `ProfileLevel=High_AutoLevel`.
+- **VideoToolbox H.264/HEVC** — Apple media engine hardware encode/decode. Configured for minimal latency: `RealTime=true`, `AllowFrameReordering=false`, `MaxFrameDelayCount=0`. HEVC mode (`--codec hevc`) produces sharper text and screen content at the same bitrate.
 - **UDP transport** — no retransmission (real-time). Frames fragmented into 1300-byte datagrams. Keyframe requested on connect and on decode failure.
 - **SPS/PPS out-of-band** — parameter sets sent as control packets on keyframes; client builds `CMVideoFormatDescription` and feeds AVCC NALUs directly to `AVSampleBufferDisplayLayer`.
 - **Normalized input coordinates** — mouse position sent as 0.0-1.0 normalized within the captured display, mapped to global CG coordinates on the host. Retina scaling and multi-monitor offsets handled transparently.
@@ -100,14 +100,15 @@ Accessibility permission: GRANTED
 ### Host (the Mac being controlled)
 
 ```sh
-.build/out/Products/Debug/mac_remote_host [--port 42420] [--fps 60] [--bitrate 25] [--display 0] [--client-timeout 10]
+.build/out/Products/Debug/mac_remote_host [--port 42420] [--fps 60] [--bitrate 40] [--codec h264] [--display 0] [--client-timeout 10]
 ```
 
 | Flag                 | Default | Description                                                              |
 | -------------------- | ------- | ------------------------------------------------------------------------ |
 | `--port`           | 42420   | UDP port (LAN mode only)                                                 |
 | `--fps`            | 60      | capture/encode framerate                                                 |
-| `--bitrate`        | 25      | H.264 bitrate in Mbps (use 40-80 on LAN for near-lossless text)          |
+| `--bitrate`        | 40      | bitrate in Mbps (use 60-100 on LAN for near-lossless text)               |
+| `--codec`          | h264    | video codec: `h264` or `hevc` (HEVC is sharper for text/screen content)  |
 | `--display`        | 0       | initial display index (use`--display 1` for second monitor)            |
 | `--client-timeout` | 10      | seconds without client packets before pausing video                      |
 | `--relay R:42430`  | —      | connect to relayd instead of LAN listening                               |
@@ -132,7 +133,7 @@ Available displays: 2
 
 **LAN mode:**
 ```sh
-scripts/install_service.sh [--port 42420] [--fps 60] [--bitrate 25] [--display 0] [--client-timeout 10]
+scripts/install_service.sh [--port 42420] [--fps 60] [--bitrate 40] [--codec h264] [--display 0] [--client-timeout 10]
 ```
 
 **Relay mode:**
@@ -149,7 +150,8 @@ Password can also be set via `MAC_REMOTE_PASSWORD` env var instead of `--passwor
 | `--password PW` | — | Device password (or `$MAC_REMOTE_PASSWORD`) |
 | `--port N` | 42420 | UDP port (LAN mode only) |
 | `--fps N` | 60 | Capture/encode framerate |
-| `--bitrate N` | 25 | H.264 bitrate in Mbps |
+| `--bitrate N` | 40 | Bitrate in Mbps |
+| `--codec CODEC` | h264 | Video codec: h264 or hevc |
 | `--display N` | 0 | Initial display index |
 | `--client-timeout S` | 10 | Client inactivity timeout |
 | `--binary PATH` | — | Use prebuilt binary instead of building |
@@ -234,7 +236,7 @@ To unlock a locked remote Mac, press **Cmd+Shift+U** on the client, enter the ho
 | ----- | --------------- | ------------ | ------------------------------------------------------------------------------------- |
 | 0     | hello           | client→host | —                                                                                    |
 | 1     | helloAck        | host→client | —                                                                                    |
-| 2     | params          | host→client | SPS + PPS (out-of-band)                                                               |
+| 2     | params          | host→client | codec + param sets (SPS+PPS for H.264, VPS+SPS+PPS for HEVC)                           |
 | 3     | keyframeRequest | client→host | —                                                                                    |
 | 4     | switchDisplay   | client→host | display index (255 = cycle next)                                                      |
 | 5     | displayInfo     | host→client | current index, total count                                                            |

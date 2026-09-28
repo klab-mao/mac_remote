@@ -2,24 +2,25 @@ import Foundation
 import VideoToolbox
 import CoreMedia
 import CoreVideo
+import MacRemoteCore
 
 final class H264Encoder {
-    var onEncodedFrame: ((Data, Bool, Data, Data) -> Void)?
+    var onEncodedFrame: ((Data, Bool, [Data]) -> Void)?
 
     private var session: VTCompressionSession?
-    private var cachedSPS: Data?
-    private var cachedPPS: Data?
+    private var cachedParamSets: [Data] = []
     private var forceNextKeyframe = false
     private let lock = NSLock()
 
     private(set) var width: Int = 0
     private(set) var height: Int = 0
+    private(set) var codecType: CodecType = .h264
 
-    func setup(width: Int, height: Int, fps: Int, bitrateMbps: Int) throws {
+    func setup(width: Int, height: Int, fps: Int, bitrateMbps: Int, codec: CodecType) throws {
         lock.lock()
         defer { lock.unlock() }
 
-        print("Encoder setup: \(width)x\(height) \(bitrateMbps)Mbps...")
+        print("Encoder setup: \(width)x\(height) \(bitrateMbps)Mbps \(codec == .hevc ? "HEVC" : "H.264")...")
         var sessionRef: VTCompressionSession?
         let imageBufferAttributes: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
@@ -29,11 +30,12 @@ final class H264Encoder {
             kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true
         ]
 
+        let cmCodecType: CMVideoCodecType = codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
-            codecType: kCMVideoCodecType_H264,
+            codecType: cmCodecType,
             encoderSpecification: encoderSpecification as CFDictionary,
             imageBufferAttributes: imageBufferAttributes as CFDictionary,
             compressedDataAllocator: nil,
@@ -45,10 +47,12 @@ final class H264Encoder {
             throw EncoderError.createFailed(status)
         }
         session = s
+        codecType = codec
 
+        let profileLevel: CFString = codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel
         let props: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
-            kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_High_AutoLevel,
+            kVTCompressionPropertyKey_ProfileLevel: profileLevel,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
             kVTCompressionPropertyKey_MaxFrameDelayCount: 0,
             kVTCompressionPropertyKey_AverageBitRate: bitrateMbps * 1_000_000,
@@ -68,9 +72,8 @@ final class H264Encoder {
 
         self.width = width
         self.height = height
-        cachedSPS = nil
-        cachedPPS = nil
-        print("Encoder ready: \(width)x\(height) \(bitrateMbps)Mbps H.264 HW")
+        cachedParamSets = []
+        print("Encoder ready: \(width)x\(height) \(bitrateMbps)Mbps \(codec == .hevc ? "HEVC" : "H.264") HW")
     }
 
     func encode(_ pixelBuffer: CVPixelBuffer, time: CMTime) {
@@ -119,26 +122,8 @@ final class H264Encoder {
 
         guard let formatDesc = CMSampleBufferGetFormatDescription(sb) else { return }
 
-        var spsPtr: UnsafePointer<UInt8>?
-        var ppsPtr: UnsafePointer<UInt8>?
-        var spsSize = 0
-        var ppsSize = 0
-        var nalCount = 0
-        var nalHeaderLength: Int32 = 0
-
-        let sStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            formatDesc, parameterSetIndex: 0, parameterSetPointerOut: &spsPtr,
-            parameterSetSizeOut: &spsSize, parameterSetCountOut: &nalCount,
-            nalUnitHeaderLengthOut: &nalHeaderLength)
-        let pStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            formatDesc, parameterSetIndex: 1, parameterSetPointerOut: &ppsPtr,
-            parameterSetSizeOut: &ppsSize, parameterSetCountOut: &nalCount,
-            nalUnitHeaderLengthOut: &nalHeaderLength)
-        guard sStatus == noErr, pStatus == noErr,
-              let sps = spsPtr, let pps = ppsPtr else { return }
-
-        let spsData = Data(bytes: sps, count: spsSize)
-        let ppsData = Data(bytes: pps, count: ppsSize)
+        let paramSets = extractParameterSets(formatDesc)
+        guard !paramSets.isEmpty else { return }
 
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sb) else { return }
         let length = CMBlockBufferGetDataLength(blockBuffer)
@@ -146,15 +131,45 @@ final class H264Encoder {
         let copyStatus = CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: &bytes)
         guard copyStatus == noErr else { return }
 
-        let isKeyframe = Self.detectIDR(bytes)
+        let isKeyframe = codecType == .hevc ? Self.detectHEVCIDR(bytes) : Self.detectIDR(bytes)
         if isKeyframe {
             lock.lock()
-            cachedSPS = spsData
-            cachedPPS = ppsData
+            cachedParamSets = paramSets
             lock.unlock()
         }
 
-        onEncodedFrame?(Data(bytes), isKeyframe, spsData, ppsData)
+        onEncodedFrame?(Data(bytes), isKeyframe, paramSets)
+    }
+
+    private func extractParameterSets(_ formatDesc: CMVideoFormatDescription) -> [Data] {
+        var nalCount = 0
+        var nalHeaderLength: Int32 = 0
+        var sets: [Data] = []
+
+        if codecType == .hevc {
+            for i in 0..<3 {
+                var ptr: UnsafePointer<UInt8>?
+                var size = 0
+                let s = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                    formatDesc, parameterSetIndex: i, parameterSetPointerOut: &ptr,
+                    parameterSetSizeOut: &size, parameterSetCountOut: &nalCount,
+                    nalUnitHeaderLengthOut: &nalHeaderLength)
+                guard s == noErr, let p = ptr else { return [] }
+                sets.append(Data(bytes: p, count: size))
+            }
+        } else {
+            for i in 0..<2 {
+                var ptr: UnsafePointer<UInt8>?
+                var size = 0
+                let s = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    formatDesc, parameterSetIndex: i, parameterSetPointerOut: &ptr,
+                    parameterSetSizeOut: &size, parameterSetCountOut: &nalCount,
+                    nalUnitHeaderLengthOut: &nalHeaderLength)
+                guard s == noErr, let p = ptr else { return [] }
+                sets.append(Data(bytes: p, count: size))
+            }
+        }
+        return sets
     }
 
     static func detectIDR(_ bytes: [UInt8]) -> Bool {
@@ -166,6 +181,20 @@ final class H264Encoder {
             let nalType = bytes[offset + 4] & 0x1F
             if nalType == 5 { return true }
             if nalType == 1 { return false }
+            offset += 4 + nalLen
+        }
+        return false
+    }
+
+    static func detectHEVCIDR(_ bytes: [UInt8]) -> Bool {
+        var offset = 0
+        while offset + 4 <= bytes.count {
+            let nalLen = Int(bytes[offset]) << 24 | Int(bytes[offset + 1]) << 16
+                | Int(bytes[offset + 2]) << 8 | Int(bytes[offset + 3])
+            guard nalLen > 0, offset + 4 + nalLen <= bytes.count else { break }
+            let nalType = (bytes[offset + 4] >> 1) & 0x3F
+            if nalType >= 16 && nalType <= 21 { return true }
+            if nalType >= 0 && nalType <= 9 { return false }
             offset += 4 + nalLen
         }
         return false

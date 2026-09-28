@@ -11,6 +11,7 @@ final class HostEngine {
     private let displayIndex: Int
     private let clientTimeout: TimeInterval
     private let relay: RelaySpec?
+    private let codec: CodecType
 
     private let capture = CaptureEngine()
     private let encoder = H264Encoder()
@@ -29,13 +30,14 @@ final class HostEngine {
         var password: String
     }
 
-    init(port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int, clientTimeout: TimeInterval, relay: RelaySpec?) {
+    init(port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int, clientTimeout: TimeInterval, relay: RelaySpec?, codec: CodecType) {
         self.port = port
         self.fps = fps
         self.bitrateMbps = bitrateMbps
         self.displayIndex = displayIndex
         self.clientTimeout = clientTimeout
         self.relay = relay
+        self.codec = codec
     }
 
     func start() {
@@ -44,8 +46,8 @@ final class HostEngine {
             self?.sendLockState()
         }
 
-        encoder.onEncodedFrame = { [weak self] data, isKeyframe, sps, pps in
-            self?.handleEncoded(data: data, isKeyframe: isKeyframe, sps: sps, pps: pps)
+        encoder.onEncodedFrame = { [weak self] data, isKeyframe, paramSets in
+            self?.handleEncoded(data: data, isKeyframe: isKeyframe, paramSets: paramSets)
         }
 
         capture.onFrame = { [weak self] pixelBuffer, time in
@@ -77,7 +79,7 @@ final class HostEngine {
                 do {
                     let (w, h) = try await self.capture.prepare(displayIndex: self.displayIndex, fps: self.fps)
                     self.currentDisplayID = self.capture.displays[self.capture.currentIndex].displayID
-                    try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps)
+                    try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps, codec: self.codec)
                     try await self.capture.beginStream()
                     break
                 } catch {
@@ -220,7 +222,7 @@ final class HostEngine {
                 let (w, h, did) = try await self.capture.switchDisplay(index)
                 self.currentDisplayID = did
                 if w != self.encoder.width || h != self.encoder.height {
-                    try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps)
+                    try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps, codec: self.codec)
                 }
                 self.encoder.forceKeyFrame()
                 self.sendDisplayInfo()
@@ -233,7 +235,7 @@ final class HostEngine {
 
     private var encodedDebugCount = 0
 
-    private func handleEncoded(data: Data, isKeyframe: Bool, sps: Data, pps: Data) {
+    private func handleEncoded(data: Data, isKeyframe: Bool, paramSets: [Data]) {
         stateLock.lock()
         let t = transport
         let elapsed = Date().timeIntervalSince(lastClientActivity)
@@ -260,10 +262,12 @@ final class HostEngine {
         if isKeyframe {
             var params = Data()
             params.append(ControlSubType.params.rawValue)
-            params.append(UInt8(sps.count))
-            params.append(sps)
-            params.append(UInt8(pps.count))
-            params.append(pps)
+            params.append(codec.rawValue)
+            params.append(UInt8(paramSets.count))
+            for ps in paramSets {
+                params.append(UInt8(ps.count))
+                params.append(ps)
+            }
             t.send(type: .control, payload: params)
         }
 
@@ -278,16 +282,17 @@ final class HostEngine {
     }
 }
 
-func parseArgs() -> (port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int, clientTimeout: TimeInterval, relay: HostEngine.RelaySpec?, debug: Bool) {
+func parseArgs() -> (port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int, clientTimeout: TimeInterval, relay: HostEngine.RelaySpec?, codec: CodecType, debug: Bool) {
     var port: UInt16 = 42420
     var fps = 60
-    var bitrate = 25
+    var bitrate = 40
     var displayIndex = 0
     var clientTimeout: TimeInterval = 10
     var relayHost: String?
     var relayPort: UInt16 = 42430
     var deviceId: String?
     var password: String?
+    var codec: CodecType = .h264
     var debug = false
     let args = CommandLine.arguments
     var i = 1
@@ -323,6 +328,12 @@ func parseArgs() -> (port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int
             i += 1
         case "--debug":
             debug = true
+        case "--codec":
+            if i + 1 < args.count {
+                let c = args[i + 1].lowercased()
+                codec = c == "hevc" || c == "h265" ? .hevc : .h264
+            }
+            i += 1
         default:
             break
         }
@@ -342,7 +353,7 @@ func parseArgs() -> (port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int
         relay = HostEngine.RelaySpec(host: rh, controlPort: relayPort, deviceId: id, password: pass ?? "")
     }
 
-    return (port, fps, bitrate, displayIndex, clientTimeout, relay, debug)
+    return (port, fps, bitrate, displayIndex, clientTimeout, relay, codec, debug)
 }
 
 setvbuf(stdout, nil, _IONBF, 0)
@@ -369,7 +380,8 @@ let engine = HostEngine(
     bitrateMbps: config.bitrateMbps,
     displayIndex: config.displayIndex,
     clientTimeout: config.clientTimeout,
-    relay: config.relay
+    relay: config.relay,
+    codec: config.codec
 )
 engine.start()
 
