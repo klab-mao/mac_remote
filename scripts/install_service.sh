@@ -193,6 +193,9 @@ echo "==> Installing binary to $BIN_PATH"
 cp "$SRC_BIN" "$BIN_PATH"
 chmod +x "$BIN_PATH"
 
+echo "==> Re-signing with stable identifier ($LABEL) so TCC permissions survive rebuilds"
+codesign -f -s - --identifier "$LABEL" "$BIN_PATH"
+
 echo "==> Writing $PLIST"
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -250,9 +253,8 @@ echo "  stop   :  launchctl bootout $LAUNCH_DOMAIN \"$PLIST\""
 echo "  logs   :  tail -f \"$LOG_FILE\""
 echo
 if [ "$UPGRADE" = true ]; then
-    echo "Binary updated — permissions are already granted for this path."
-    echo "If the host was reinstalled to a different path, re-grant in"
-    echo "System Settings > Privacy & Security > Screen Recording / Accessibility."
+    echo "Binary updated — re-signed with stable identifier, TCC permissions preserved."
+    echo "If permissions show NOT GRANTED, toggle OFF→ON in System Settings."
 else
     echo "IMPORTANT — permissions are granted per binary path. If not already granted"
     echo "for the installed copy:"

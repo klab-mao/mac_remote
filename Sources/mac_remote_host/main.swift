@@ -71,14 +71,18 @@ final class HostEngine {
         }
 
         Task {
-            do {
-                let (w, h) = try await self.capture.prepare(displayIndex: self.displayIndex, fps: self.fps)
-                self.currentDisplayID = self.capture.displays[self.capture.currentIndex].displayID
-                try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps)
-                try await self.capture.beginStream()
-            } catch {
-                print("Startup failed: \(error)")
-                exit(1)
+            while true {
+                do {
+                    let (w, h) = try await self.capture.prepare(displayIndex: self.displayIndex, fps: self.fps)
+                    self.currentDisplayID = self.capture.displays[self.capture.currentIndex].displayID
+                    try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps)
+                    try await self.capture.beginStream()
+                    break
+                } catch {
+                    print("Startup failed: \(error) — retrying in 5s")
+                    _ = CGRequestScreenCaptureAccess()
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                }
             }
         }
     }
