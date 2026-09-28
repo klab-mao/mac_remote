@@ -3,6 +3,7 @@
 Internal-use macOS screen sharing tool (macOS-to-macOS), built as a replacement for the slow built-in Screen Sharing (VNC). Goal: TeamViewer-level smoothness with visually lossless image quality.
 
 **Two connection modes:**
+
 - **LAN mode** — direct UDP between Macs on the same network (lowest latency).
 - **Relay mode** — both sides connect outbound to your own cloud server (`relayd`, Go), bridging two intranets across NAT, with per-user login accounts configured server-side. See [docs/RELAY.md](docs/RELAY.md).
 
@@ -88,6 +89,7 @@ The host needs two permissions. Run it once from the terminal, then grant:
 Restart the host after granting. The client needs no special permissions.
 
 The host prints permission status at startup:
+
 ```
 Screen Recording permission: GRANTED
 Accessibility permission: GRANTED
@@ -101,17 +103,17 @@ Accessibility permission: GRANTED
 .build/out/Products/Debug/mac_remote_host [--port 42420] [--fps 60] [--bitrate 25] [--display 0] [--client-timeout 10]
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port` | 42420 | UDP port (LAN mode only) |
-| `--fps` | 60 | capture/encode framerate |
-| `--bitrate` | 25 | H.264 bitrate in Mbps (use 40-80 on LAN for near-lossless text) |
-| `--display` | 0 | initial display index (use `--display 1` for second monitor) |
-| `--client-timeout` | 10 | seconds without client packets before pausing video |
-| `--relay R:42430` | — | connect to relayd instead of LAN listening |
-| `--device-id` | — | device name registered on the relay (required with `--relay`) |
-| `--password` | — | device account password (prompted or `$MAC_REMOTE_PASSWORD` if omitted) |
-| `--debug` | — | verbose logging |
+| Flag                 | Default | Description                                                              |
+| -------------------- | ------- | ------------------------------------------------------------------------ |
+| `--port`           | 42420   | UDP port (LAN mode only)                                                 |
+| `--fps`            | 60      | capture/encode framerate                                                 |
+| `--bitrate`        | 25      | H.264 bitrate in Mbps (use 40-80 on LAN for near-lossless text)          |
+| `--display`        | 0       | initial display index (use`--display 1` for second monitor)            |
+| `--client-timeout` | 10      | seconds without client packets before pausing video                      |
+| `--relay R:42430`  | —      | connect to relayd instead of LAN listening                               |
+| `--device-id`      | —      | device name registered on the relay (required with`--relay`)           |
+| `--password`       | —      | device account password (prompted or`$MAC_REMOTE_PASSWORD` if omitted) |
+| `--debug`          | —      | verbose logging                                                          |
 
 Relay mode example (see [docs/RELAY.md](docs/RELAY.md) for server setup):
 
@@ -120,27 +122,48 @@ mac_remote_host --relay relay.example.com:42430 --device-id office-mac
 ```
 
 The host enumerates all displays at startup and prints them:
+
 ```
 Available displays: 2
   [0] id=3 2560x1440 origin=(0,0)
   [1] id=1 2560x1440 origin=(2560,0)
 ```
+`scripts/install_service.sh` installs the host as a **per-user LaunchAgent** that starts at login and is restarted on crash. It wraps the binary in a `.app` bundle for reliable TCC permission handling on macOS 27+. A system LaunchDaemon would not work: ScreenCaptureKit can only capture from a logged-in GUI session, and TCC permissions are granted per user.
 
-### Run the host as a service (launchd)
-
-`scripts/install_service.sh` installs the host as a **per-user LaunchAgent** that starts at login and is restarted on crash. A system LaunchDaemon would not work: ScreenCaptureKit can only capture from a logged-in GUI session, and TCC permissions (Screen Recording / Accessibility) are granted per user.
-
+**LAN mode:**
 ```sh
-scripts/install_service.sh [--port 42420] [--fps 60] [--bitrate 25] [--display 0] [--client-timeout 10] [--binary PATH]
+scripts/install_service.sh [--port 42420] [--fps 60] [--bitrate 25] [--display 0] [--client-timeout 10]
 ```
 
-It builds a universal Release binary if none exists (falling back to a native-arch Release build on machines with only Command Line Tools, where universal builds are unavailable), copies it to `~/Library/Application Support/mac_remote/bin/mac_remote_host`, writes `~/Library/LaunchAgents/com.mac_remote.host.plist`, and loads it. Re-running replaces the service with the new settings. Log: `~/Library/Application Support/mac_remote/host.log`.
+**Relay mode:**
+```sh
+scripts/install_service.sh --relay 150.158.133.56:42430 --device-id office-mac [--password 123456]
+```
+
+Password can also be set via `MAC_REMOTE_PASSWORD` env var instead of `--password`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--relay HOST:PORT` | — | Relay server address (enables relay mode) |
+| `--device-id NAME` | — | Device name registered on relay (required with `--relay`) |
+| `--password PW` | — | Device password (or `$MAC_REMOTE_PASSWORD`) |
+| `--port N` | 42420 | UDP port (LAN mode only) |
+| `--fps N` | 60 | Capture/encode framerate |
+| `--bitrate N` | 25 | H.264 bitrate in Mbps |
+| `--display N` | 0 | Initial display index |
+| `--client-timeout S` | 10 | Client inactivity timeout |
+| `--binary PATH` | — | Use prebuilt binary instead of building |
+
+It builds a universal Release binary if none exists, wraps it in a `.app` bundle at `~/Library/Application Support/mac_remote/mac_remote_host.app`, writes `~/Library/LaunchAgents/com.mac_remote.host.plist`, and loads it. Re-running replaces the service with the new settings (flags not specified are preserved from the existing plist). Log: `~/Library/Application Support/mac_remote/host.log`.
 
 ```sh
 launchctl list com.mac_remote.host                           # status
 launchctl kickstart -k gui/$(id -u)/com.mac_remote.host      # restart
 tail -f "$HOME/Library/Application Support/mac_remote/host.log"
 scripts/uninstall_service.sh                                 # stop + remove everything
+```
+
+TCC permissions are bound to the `.app` bundle: after installing, grant Screen Recording and Accessibility to `~/Library/Application Support/mac_remote/mac_remote_host.app` in System Settings, then restart the service and check the log for `permission: GRANTED`. If permissions were granted to a previous build and now show NOT GRANTED (stale TCC cache), reboot the Mac to flush the cache.
 ```
 
 TCC permissions are bound to the binary **path**: after installing, grant Screen Recording and Accessibility to the installed copy (`~/Library/Application Support/mac_remote/bin/mac_remote_host`) — not the build output — then restart the service and check the log for `permission: GRANTED`.
@@ -165,10 +188,10 @@ The client opens a borderless fullscreen window (level: floating, activation pol
 
 ### Hotkeys
 
-| Key | Action |
-|-----|--------|
-| **ESC** | Quit the client |
-| **Cmd+Shift+D** | Cycle to the next display on the host |
+| Key                   | Action                                                     |
+| --------------------- | ---------------------------------------------------------- |
+| **ESC**         | Quit the client                                            |
+| **Cmd+Shift+D** | Cycle to the next display on the host                      |
 | **Cmd+Shift+U** | Unlock the remote Mac's lock screen (prompts for password) |
 
 When switching displays, an overlay shows `Display X / Y` for ~2.5 seconds. The host reconfigures the encoder if the new display has a different resolution and forces a keyframe.
@@ -207,17 +230,17 @@ To unlock a locked remote Mac, press **Cmd+Shift+U** on the client, enter the ho
 
 ### Control subtypes
 
-| Value | Name | Direction | Payload |
-|-------|------|-----------|---------|
-| 0 | hello | client→host | — |
-| 1 | helloAck | host→client | — |
-| 2 | params | host→client | SPS + PPS (out-of-band) |
-| 3 | keyframeRequest | client→host | — |
-| 4 | switchDisplay | client→host | display index (255 = cycle next) |
-| 5 | displayInfo | host→client | current index, total count |
-| 6 | unlockRequest | client→host | password (UTF-8) |
-| 7 | unlockResult | host→client | result code (0=unlocked, 1=notLocked, 2=stillLocked, 3=unsupportedCharacter, 4=error) |
-| 8 | lockState | host→client | 1 = locked, 0 = unlocked |
+| Value | Name            | Direction    | Payload                                                                               |
+| ----- | --------------- | ------------ | ------------------------------------------------------------------------------------- |
+| 0     | hello           | client→host | —                                                                                    |
+| 1     | helloAck        | host→client | —                                                                                    |
+| 2     | params          | host→client | SPS + PPS (out-of-band)                                                               |
+| 3     | keyframeRequest | client→host | —                                                                                    |
+| 4     | switchDisplay   | client→host | display index (255 = cycle next)                                                      |
+| 5     | displayInfo     | host→client | current index, total count                                                            |
+| 6     | unlockRequest   | client→host | password (UTF-8)                                                                      |
+| 7     | unlockResult    | host→client | result code (0=unlocked, 1=notLocked, 2=stillLocked, 3=unsupportedCharacter, 4=error) |
+| 8     | lockState       | host→client | 1 = locked, 0 = unlocked                                                              |
 
 ### Input packet (28 bytes)
 
@@ -238,6 +261,7 @@ To unlock a locked remote Mac, press **Cmd+Shift+U** on the client, enter the ho
 Both sides print diagnostic logs for the first few events to help troubleshoot:
 
 **Host:**
+
 ```
 Encoder setup: 2560x1440 40Mbps...
 Encoder ready: 2560x1440 40Mbps H.264 HW
@@ -246,6 +270,7 @@ input #1: kind=mouseDown button=0 nx=0.5 ny=0.5 -> global (1280,720)
 ```
 
 **Client:**
+
 ```
 Format ready: 2560x1440
 monitor saw leftMouseDown: ... match=true isKey=true
@@ -254,6 +279,7 @@ fps: 60
 ```
 
 If clicks aren't working, check:
+
 1. Host prints `Accessibility permission: GRANTED` — if not, grant it and restart.
 2. Host prints `input #1:` lines — if not, the client isn't sending (check client log).
 3. Client prints `input captured #1:` — if not, `normalizedPoint` is returning nil (check for `normalizedPoint nil:` log showing zero bounds/remoteSize).
