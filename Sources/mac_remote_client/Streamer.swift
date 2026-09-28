@@ -24,8 +24,8 @@ final class Streamer {
     private var assembledDebugCount = 0
 
     // Adaptive bitrate state
-    private var maxBitrate: Int = 40
-    private var currentBitrate: Int = 40
+    private var maxBitrate: Int = 10
+    private var currentBitrate: Int = 10
     private var recentLossCount = 0
     private var recentTotalCount = 0
     private var lowLossStreak = 0

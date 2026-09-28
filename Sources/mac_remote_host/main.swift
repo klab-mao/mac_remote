@@ -275,11 +275,8 @@ final class HostEngine {
         let fid = frameId
         stateLock.unlock()
         let datagrams = Packetizer.fragment(data, frameId: fid, isKeyframe: isKeyframe)
-        let sends = isKeyframe ? 3 : 1
         for d in datagrams {
-            for _ in 0..<sends {
-                t.sendDatagram(d)
-            }
+            t.sendDatagram(d)
         }
     }
 }

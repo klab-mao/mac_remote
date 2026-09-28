@@ -152,8 +152,15 @@ final class RawUDPSocket {
             data.withUnsafeBytes { ptr in
                 withUnsafePointer(to: sin) { sinPtr in
                     sinPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saddr in
-                        _ = sendto(self.fd, ptr.baseAddress, data.count, 0,
-                                   saddr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        var retries = 0
+                        while retries < 20 {
+                            let result = sendto(self.fd, ptr.baseAddress, data.count, 0,
+                                               saddr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                            if result >= 0 { break }
+                            if errno != EAGAIN && errno != ENOBUFS { break }
+                            usleep(500)
+                            retries += 1
+                        }
                     }
                 }
             }
