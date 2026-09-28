@@ -134,17 +134,24 @@ ssh "$SSH_HOST" "chmod 600 ${REMOTE_DIR}/accounts.json 2>/dev/null || true"
 # ---- systemd service ----------------------------------------------------------
 
 echo "==> Installing systemd service"
+
+# Resolve remote home dir and user for absolute paths in systemd unit
+REMOTE_HOME=$(ssh "$SSH_HOST" 'echo $HOME')
+REMOTE_USER=$(ssh "$SSH_HOST" 'whoami')
+# Expand ~ in* in REMOTE_DIR to absolute path
+REMOTE_DIR_ABS="${REMOTE_DIR/#\~/$REMOTE_HOME}"
+
 ssh "$SSH_HOST" "sudo tee ${SERVICE_FILE} >/dev/null" <<EOF
 [Unit]
 Description=mac_remote relay server
 After=network.target
 
 [Service]
-ExecStart=${REMOTE_DIR}/relayd -control ${CONTROL_PORT} -udp ${UDP_PORT} -config ${REMOTE_DIR}/accounts.json
+ExecStart=${REMOTE_DIR_ABS}/relayd -control ${CONTROL_PORT} -udp ${UDP_PORT} -config ${REMOTE_DIR_ABS}/accounts.json
 Restart=always
 RestartSec=3
-User=\$(whoami)
-WorkingDirectory=${REMOTE_DIR}
+User=${REMOTE_USER}
+WorkingDirectory=${REMOTE_DIR_ABS}
 
 [Install]
 WantedBy=multi-user.target
