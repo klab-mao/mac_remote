@@ -436,10 +436,6 @@ public final class RelayTransport: Transport {
 
     public func sendDatagram(_ data: Data) {
         guard phase == .established else { return }
-        if directMode, let host = peerHost {
-            dataSocket?.sendTo(data, host: host, port: peerPort)
-        } else {
-            dataSocket?.sendTo(data, host: relayHost, port: relayUdpPort)
-        }
+        dataSocket?.sendTo(data, host: relayHost, port: relayUdpPort)
     }
 }
