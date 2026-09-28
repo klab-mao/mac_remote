@@ -246,6 +246,9 @@ guard let cfg = clientConfig else {
     exit(2)
 }
 
+setvbuf(stdout, nil, _IONBF, 0)
+setvbuf(stderr, nil, _IONBF, 0)
+
 Log.verbose = cfg.debug
 print("Connecting via \(cfg.modeLabel)")
 

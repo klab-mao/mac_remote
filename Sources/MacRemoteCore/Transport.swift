@@ -68,14 +68,11 @@ public final class UDPListener {
         do {
             let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
             l.stateUpdateHandler = { state in
-                switch state {
-                case .ready: print("Listener ready on port \(port)")
-                case .failed(let error): print("Listener failed: \(error)")
-                default: break
+                if case .failed(let error) = state {
+                    print("Listener failed: \(error)")
                 }
             }
             l.newConnectionHandler = { [weak self] conn in
-                print(">>> newConnectionHandler called: \(conn)")
                 let flow = UDPFlow(connection: conn, queue: self?.queue ?? DispatchQueue(label: "mac_remote.udp.flow"))
                 self?.onFlow?(flow)
             }
