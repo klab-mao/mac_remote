@@ -203,6 +203,8 @@ public final class RelayTransport: Transport {
     private var directMode = false
     private var punchTimer: DispatchSourceTimer?
     private var punchAttempts = 0
+    private var bindTimer: DispatchSourceTimer?
+    private var bindPacket = Data()
 
     private enum Phase {
         case disconnected
@@ -337,13 +339,22 @@ public final class RelayTransport: Transport {
         sock.start()
         dataSocket = sock
 
-        var bind = Data()
-        bind.append(contentsOf: Array("RMBD".utf8))
-        bind.appendLE(sessionId)
+        bindPacket = Data()
+        bindPacket.append(contentsOf: Array("RMBD".utf8))
+        bindPacket.appendLE(sessionId)
         let side: UInt8
         if case .host = role { side = 1 } else { side = 2 }
-        bind.append(side)
-        sock.sendTo(bind, host: relayHost, port: udpPort)
+        bindPacket.append(side)
+        sock.sendTo(bindPacket, host: relayHost, port: udpPort)
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .seconds(2), repeating: .seconds(2))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.dataSocket?.sendTo(self.bindPacket, host: self.relayHost, port: self.relayUdpPort)
+        }
+        timer.resume()
+        bindTimer = timer
 
         phase = .established
         onState?("relay session \(sessionId) ready (udp \(udpPort))")
