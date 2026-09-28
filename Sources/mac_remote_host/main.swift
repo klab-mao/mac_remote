@@ -16,6 +16,7 @@ final class HostEngine {
     private let encoder = H264Encoder()
     private let stateLock = NSLock()
     private var transport: Transport?
+    private var listener: UDPListener?
     private var frameId: UInt32 = 0
     private var currentDisplayID: CGDirectDisplayID = CGMainDisplayID()
     private var lastClientActivity: Date = .distantPast
@@ -62,11 +63,12 @@ final class HostEngine {
             rt.start()
             print("Host connecting to relay \(relay.host):\(relay.controlPort) as device '\(relay.deviceId)'")
         } else {
-            let listener = UDPListener(port: port)
-            listener.onFlow = { [weak self] flow in
+            let l = UDPListener(port: port)
+            l.onFlow = { [weak self] flow in
                 self?.attachTransport(flow, label: "client")
             }
-            listener.start()
+            l.start()
+            listener = l
             print("Host listening on UDP port \(port)")
         }
 
