@@ -67,6 +67,9 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
                 layer.enqueue(sampleBuffer)
+                if self.frameCount <= 3 {
+                    print("enqueue #\(self.frameCount): layer.status=\(layer.status) frame=\(layer.frame)")
+                }
             }
         }
 
@@ -132,7 +135,8 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let fps = self.frameCount
             self.frameCount = 0
-            Log.v("fps: \(fps)")
+            let layer = self.videoView?.displayLayer
+            print("fps: \(fps) layer.status=\(layer?.status ?? .unknown) frame=\(String(describing: layer?.frame))")
         }
 
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in

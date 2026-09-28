@@ -253,9 +253,9 @@ final class HostEngine {
 
         guard let t else { return }
 
-        if encodedDebugCount < 3 {
+        if encodedDebugCount < 5 {
             encodedDebugCount += 1
-            Log.v("encoded #\(encodedDebugCount): \(data.count) bytes, keyframe=\(isKeyframe), frags=\((data.count + 1299) / 1300)")
+            print("encoded #\(encodedDebugCount): \(data.count) bytes, keyframe=\(isKeyframe)")
         }
 
         if isKeyframe {
