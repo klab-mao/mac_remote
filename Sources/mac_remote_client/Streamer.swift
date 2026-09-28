@@ -22,6 +22,7 @@ final class Streamer {
     private var pingTimer: Timer?
     private var waitingForKeyframe = false
     private var assembledDebugCount = 0
+    private var kfFragCount = 0
 
     // Adaptive bitrate state
     private var maxBitrate: Int = 10
@@ -205,6 +206,12 @@ final class Streamer {
 
     private func handleVideo(header: PacketHeader, payload: Data) {
         let isKeyframe = (header.flags & 1) != 0
+        if isKeyframe {
+            kfFragCount += 1
+            if kfFragCount <= 3 || kfFragCount % 50 == 0 {
+                print("kf frag #\(kfFragCount): idx=\(header.fragIndex)/\(header.fragCount) frameId=\(header.frameId)")
+            }
+        }
         if waitingForKeyframe {
             guard isKeyframe else {
                 Log.v("skipping P-frame while waiting for keyframe (frameId=\(header.frameId))")
