@@ -23,6 +23,7 @@ final class Streamer {
     private var waitingForKeyframe = false
     private var assembledDebugCount = 0
     private var kfFragCount = 0
+    private var nackSentFrames: Set<UInt32> = []
 
     // Adaptive bitrate state
     private var maxBitrate: Int = 10
@@ -39,6 +40,9 @@ final class Streamer {
         }
         assembler.onFrameLost = { [weak self] in
             self?.onFrameLost()
+        }
+        assembler.onNackNeeded = { [weak self] frameId, missing in
+            self?.sendNack(frameId: frameId, missing: missing)
         }
     }
 
@@ -58,6 +62,26 @@ final class Streamer {
 
     func requestKeyframe() {
         transport.sendControl(.keyframeRequest)
+    }
+
+    private func sendNack(frameId: UInt32, missing: [UInt16]) {
+        guard !nackSentFrames.contains(frameId) else { return }
+        nackSentFrames.insert(frameId)
+        if nackSentFrames.count > 20 {
+            nackSentFrames = nackSentFrames.filter { $0 >= frameId &- 20 }
+        }
+        var extra = Data()
+        extra.append(UInt8(frameId & 0xff))
+        extra.append(UInt8((frameId >> 8) & 0xff))
+        extra.append(UInt8((frameId >> 16) & 0xff))
+        extra.append(UInt8((frameId >> 24) & 0xff))
+        extra.append(UInt8(missing.count))
+        for idx in missing {
+            extra.append(UInt8(idx & 0xff))
+            extra.append(UInt8(idx >> 8))
+        }
+        transport.sendControl(.nack, extra: extra)
+        print("NACK: requesting \(missing.count) fragments for frameId=\(frameId)")
     }
 
     func markDecoderFailed() {
@@ -303,9 +327,11 @@ final class FrameAssembler {
     private struct AssemblingFrame {
         var fragCount: UInt16
         var parts: [UInt16: Data]
+        var isKeyframe: Bool
     }
 
     var onFrameLost: (() -> Void)?
+    var onNackNeeded: ((UInt32, [UInt16]) -> Void)?
 
     private var frames: [UInt32: AssemblingFrame] = [:]
     private var highestSeen: UInt32 = 0
@@ -328,9 +354,18 @@ final class FrameAssembler {
             return nil
         }
 
-        var frame = frames[header.frameId] ?? AssemblingFrame(fragCount: header.fragCount, parts: [:])
+        let isKeyframe = (header.flags & 1) != 0
+        var frame = frames[header.frameId] ?? AssemblingFrame(fragCount: header.fragCount, parts: [:], isKeyframe: isKeyframe)
         frame.parts[header.fragIndex] = payload
         frames[header.frameId] = frame
+
+        // NACK: if this is a keyframe and we have most fragments but not all, request missing
+        if isKeyframe && frame.parts.count >= Int(frame.fragCount) / 2 && frame.parts.count < Int(frame.fragCount) {
+            let missing = (0..<frame.fragCount).filter { frame.parts[$0] == nil }
+            if !missing.isEmpty && missing.count <= 20 {
+                onNackNeeded?(header.frameId, missing)
+            }
+        }
 
         guard frame.parts.count == Int(frame.fragCount) else { return nil }
         var data = Data()

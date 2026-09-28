@@ -22,6 +22,7 @@ final class HostEngine {
     private var currentDisplayID: CGDirectDisplayID = CGMainDisplayID()
     private var lastClientActivity: Date = .distantPast
     private var clientTimedOut = false
+    private var keyframeBuffer: [UInt32: [Data]] = [:]
 
     struct RelaySpec {
         var host: String
@@ -156,8 +157,33 @@ final class HostEngine {
             }
         case .ping:
             sendControl { $0.sendControl(.pong) }
+        case .nack:
+            handleNack(payload: payload)
         default:
             break
+        }
+    }
+
+    private func handleNack(payload: Data) {
+        guard payload.count >= 5 else { return }
+        let frameId = payload.subdata(in: 1..<5).withUnsafeBytes { $0.load(as: UInt32.self) }
+        let count = Int(payload[5])
+        guard payload.count >= 6 + count * 2 else { return }
+        stateLock.lock()
+        let frags = keyframeBuffer[frameId]
+        let t = transport
+        stateLock.unlock()
+        guard let frags, let t else { return }
+        var retransmitted = 0
+        for i in 0..<count {
+            let idx = UInt16(payload[6 + i*2]) | UInt16(payload[7 + i*2]) << 8
+            if Int(idx) < frags.count {
+                t.sendDatagram(frags[Int(idx)])
+                retransmitted += 1
+            }
+        }
+        if retransmitted > 0 {
+            Log.v("NACK: retransmitted \(retransmitted)/\(count) fragments for frameId=\(frameId)")
         }
     }
 
@@ -275,14 +301,17 @@ final class HostEngine {
         let fid = frameId
         stateLock.unlock()
         let datagrams = Packetizer.fragment(data, frameId: fid, isKeyframe: isKeyframe)
-        let sends = isKeyframe ? 3 : 1
-        for (i, d) in datagrams.enumerated() {
-            for _ in 0..<sends {
-                t.sendDatagram(d)
+        if isKeyframe {
+            stateLock.lock()
+            keyframeBuffer[fid] = datagrams
+            if keyframeBuffer.count > 3 {
+                let oldest = keyframeBuffer.keys.min() ?? fid
+                keyframeBuffer.removeValue(forKey: oldest)
             }
-            if isKeyframe && i % 10 == 9 {
-                usleep(2000)
-            }
+            stateLock.unlock()
+        }
+        for d in datagrams {
+            t.sendDatagram(d)
         }
     }
 }

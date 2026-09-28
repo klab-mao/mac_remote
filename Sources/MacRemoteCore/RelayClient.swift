@@ -212,6 +212,7 @@ public final class RelayTransport: Transport {
     private var punchAttempts = 0
     private var bindTimer: DispatchSourceTimer?
     private var bindPacket = Data()
+    private var reconnecting = false
 
     private enum Phase {
         case disconnected
@@ -241,6 +242,7 @@ public final class RelayTransport: Transport {
                 self?.onState?("relay control connected")
             case .failed(let error):
                 self?.onState?("relay control failed: \(error)")
+                self?.reconnect()
             case .waiting(let error):
                 self?.onState?("relay control waiting: \(error)")
             default:
@@ -251,6 +253,24 @@ public final class RelayTransport: Transport {
         conn.start(queue: queue)
         scheduleControlReceive()
         startPingTimer()
+    }
+
+    private func reconnect() {
+        guard !reconnecting else { return }
+        reconnecting = true
+        phase = .disconnected
+        buffer = Data()
+        pingTimer?.cancel(); pingTimer = nil
+        bindTimer?.cancel(); bindTimer = nil
+        punchTimer?.cancel(); punchTimer = nil
+        control?.cancel()
+        dataSocket = nil
+        onState?("relay reconnecting in 3s...")
+        queue.asyncAfter(deadline: .now() + .seconds(3)) { [weak self] in
+            guard let self else { return }
+            self.reconnecting = false
+            self.start()
+        }
     }
 
     private func startPingTimer() {
@@ -272,6 +292,7 @@ public final class RelayTransport: Transport {
             }
             if isComplete || error != nil {
                 self.onState?("relay control closed (\(error?.localizedDescription ?? "EOF"))")
+                self.reconnect()
                 return
             }
             self.scheduleControlReceive()
@@ -370,11 +391,7 @@ public final class RelayTransport: Transport {
     // MARK: - Data datagram handling (RPEP, PUNCH, or mac_remote packet)
 
     private func handleDataDatagram(_ data: Data) {
-        // Any packet from relay means bind succeeded — stop retrying
-        if bindTimer != nil {
-            bindTimer?.cancel()
-            bindTimer = nil
-        }
+        // Keep bind timer running to refresh NAT mapping and relay address record
         // RPEP: peer endpoint info from relay
         if data.count >= 7, data[0..<4] == Data([0x52, 0x50, 0x45, 0x50]) {
             parsePeerEndpoint(data)
@@ -402,6 +419,7 @@ public final class RelayTransport: Transport {
         let ip = String(data: data.subdata(in: 5..<(5 + ipLen)), encoding: .utf8) ?? ""
         let port = UInt16(data[5 + ipLen]) | UInt16(data[5 + ipLen + 1]) << 8
 
+        if peerHost == ip && peerPort == port { return }
         peerHost = ip
         peerPort = port
         onState?("peer endpoint: \(ip):\(port) — starting hole punch")

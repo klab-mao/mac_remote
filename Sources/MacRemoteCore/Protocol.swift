@@ -19,6 +19,7 @@ public enum ControlSubType: UInt8 {
     case ping = 9
     case pong = 10
     case setBitrate = 11
+    case nack = 12
 }
 
 public enum CodecType: UInt8 {
