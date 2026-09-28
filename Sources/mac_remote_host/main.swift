@@ -339,6 +339,9 @@ func parseArgs() -> (port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int
     return (port, fps, bitrate, displayIndex, clientTimeout, relay, debug)
 }
 
+setvbuf(stdout, nil, _IONBF, 0)
+setvbuf(stderr, nil, _IONBF, 0)
+
 let config = parseArgs()
 Log.verbose = config.debug
 
