@@ -341,10 +341,22 @@ final class FrameAssembler {
         lock.lock()
         defer { lock.unlock() }
 
+        let isKeyframe = (header.flags & 1) != 0
+
         if header.frameId > highestSeen {
             highestSeen = header.frameId
-            for (id, frame) in frames where id < highestSeen &- 32 {
-                // Frame was incomplete and is now stale — report loss
+            // When a new keyframe arrives, drop all older incomplete frames immediately
+            if isKeyframe {
+                for (id, frame) in frames where id < header.frameId && frame.parts.count < Int(frame.fragCount) {
+                    if frame.isKeyframe {
+                        onFrameLost?()
+                    }
+                    frames.removeValue(forKey: id)
+                }
+            }
+            // Drop stale frames — P-frames after 5 IDs, keyframes after 30 IDs (NACK recovery needs time)
+            for (id, frame) in frames where id < highestSeen &- 5 {
+                if frame.isKeyframe && id >= highestSeen &- 30 { continue }
                 if frame.parts.count < Int(frame.fragCount) {
                     onFrameLost?()
                 }
@@ -354,15 +366,14 @@ final class FrameAssembler {
             return nil
         }
 
-        let isKeyframe = (header.flags & 1) != 0
         var frame = frames[header.frameId] ?? AssemblingFrame(fragCount: header.fragCount, parts: [:], isKeyframe: isKeyframe)
         frame.parts[header.fragIndex] = payload
         frames[header.frameId] = frame
 
-        // NACK: if this is a keyframe and we have most fragments but not all, request missing
-        if isKeyframe && frame.parts.count >= Int(frame.fragCount) / 2 && frame.parts.count < Int(frame.fragCount) {
+        // NACK: if this is a keyframe and we have some fragments but not all, request missing
+        if isKeyframe && frame.parts.count >= Int(frame.fragCount) / 4 && frame.parts.count < Int(frame.fragCount) {
             let missing = (0..<frame.fragCount).filter { frame.parts[$0] == nil }
-            if !missing.isEmpty && missing.count <= 20 {
+            if !missing.isEmpty && missing.count <= 60 {
                 onNackNeeded?(header.frameId, missing)
             }
         }
