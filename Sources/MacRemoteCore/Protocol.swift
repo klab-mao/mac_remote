@@ -18,6 +18,7 @@ public enum ControlSubType: UInt8 {
     case lockState = 8
     case ping = 9
     case pong = 10
+    case setBitrate = 11
 }
 
 public enum Log {

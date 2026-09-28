@@ -60,6 +60,7 @@ final class H264Encoder {
             VTSessionSetProperty(s, key: key, value: value as CFTypeRef)
         }
 
+
         let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(s)
         guard prepareStatus == noErr else {
             throw EncoderError.prepareFailed(prepareStatus)
@@ -92,6 +93,16 @@ final class H264Encoder {
 
     func forceKeyFrame() {
         forceNextKeyframe = true
+    }
+
+    func setBitrate(_ bitrateMbps: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let session else { return }
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
+                             value: (bitrateMbps * 1_000_000) as CFTypeRef)
+        forceNextKeyframe = true
+        print("Encoder bitrate changed: \(bitrateMbps)Mbps")
     }
 
     func invalidate() {

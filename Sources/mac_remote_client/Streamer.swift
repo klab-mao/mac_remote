@@ -21,10 +21,21 @@ final class Streamer {
     private let formatLock = NSLock()
     private var pingTimer: Timer?
 
+    // Adaptive bitrate state
+    private var maxBitrate: Int = 25
+    private var currentBitrate: Int = 25
+    private var recentLossCount = 0
+    private var recentTotalCount = 0
+    private var lowLossStreak = 0
+    private var lastSentBitrate = 0
+
     init(transport: Transport) {
         self.transport = transport
         transport.onPacket = { [weak self] header, payload in
             self?.handle(header: header, payload: payload)
+        }
+        assembler.onFrameLost = { [weak self] in
+            self?.onFrameLost()
         }
     }
 
@@ -152,6 +163,7 @@ final class Streamer {
             requestKeyframe()
             return
         }
+        recentTotalCount += 1
         guard let avcc = assembler.push(header: header, payload: payload) else { return }
         guard let sampleBuffer = SampleBufferFactory.makeSampleBuffer(avcc, format: format, frameId: header.frameId) else {
             return
@@ -162,6 +174,61 @@ final class Streamer {
         }
         onVideoFrame?(sampleBuffer)
     }
+
+    // Called by FrameAssembler when a frame is dropped due to missing fragments.
+    private func onFrameLost() {
+        recentLossCount += 1
+        requestKeyframe()
+        adaptBitrate()
+    }
+
+    private func adaptBitrate() {
+        guard recentTotalCount >= 30 else { return }
+        let lossRate = Double(recentLossCount) / Double(recentTotalCount)
+
+        if lossRate > 0.15 {
+            // High loss — reduce bitrate aggressively
+            let newBitrate = max(5, Int(Double(currentBitrate) * 0.75))
+            if newBitrate != currentBitrate {
+                currentBitrate = newBitrate
+                sendBitrateChange()
+                lowLossStreak = 0
+            }
+        } else if lossRate < 0.03 {
+            lowLossStreak += 1
+            if lowLossStreak >= 60 && currentBitrate < maxBitrate {
+                let newBitrate = min(maxBitrate, Int(Double(currentBitrate) * 1.15))
+                if newBitrate != currentBitrate {
+                    currentBitrate = newBitrate
+                    sendBitrateChange()
+                }
+                lowLossStreak = 0
+            }
+        } else {
+            lowLossStreak = 0
+        }
+
+        // Reset window
+        if recentTotalCount >= 60 {
+            recentLossCount = 0
+            recentTotalCount = 0
+        }
+    }
+
+    private func sendBitrateChange() {
+        guard currentBitrate != lastSentBitrate else { return }
+        lastSentBitrate = currentBitrate
+        transport.sendControl(.setBitrate, extra: Data([UInt8(currentBitrate)]))
+        Log.v("adaptive bitrate: \(currentBitrate)Mbps (loss rate tracked)")
+    }
+
+    func setMaxBitrate(_ mbps: Int) {
+        maxBitrate = mbps
+        if currentBitrate > mbps {
+            currentBitrate = mbps
+            sendBitrateChange()
+        }
+    }
 }
 
 final class FrameAssembler {
@@ -169,6 +236,8 @@ final class FrameAssembler {
         var fragCount: UInt16
         var parts: [UInt16: Data]
     }
+
+    var onFrameLost: (() -> Void)?
 
     private var frames: [UInt32: AssemblingFrame] = [:]
     private var highestSeen: UInt32 = 0
@@ -180,7 +249,11 @@ final class FrameAssembler {
 
         if header.frameId > highestSeen {
             highestSeen = header.frameId
-            for (id, _) in frames where id < highestSeen &- 32 {
+            for (id, frame) in frames where id < highestSeen &- 32 {
+                // Frame was incomplete and is now stale — report loss
+                if frame.parts.count < Int(frame.fragCount) {
+                    onFrameLost?()
+                }
                 frames.removeValue(forKey: id)
             }
         } else if highestSeen &- header.frameId > 256 {
@@ -197,6 +270,7 @@ final class FrameAssembler {
         for i in 0..<frame.fragCount {
             guard let part = frame.parts[i] else {
                 frames.removeValue(forKey: header.frameId)
+                onFrameLost?()
                 return nil
             }
             data.append(part)

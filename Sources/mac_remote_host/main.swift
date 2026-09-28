@@ -134,6 +134,12 @@ final class HostEngine {
             print("Client registered, keyframe forced")
         case .keyframeRequest:
             encoder.forceKeyFrame()
+        case .setBitrate:
+            guard payload.count >= 2 else { return }
+            let mbps = Int(payload[1])
+            guard mbps >= 5 && mbps <= 100 else { return }
+            encoder.setBitrate(mbps)
+            print("Client requested bitrate: \(mbps)Mbps")
         case .switchDisplay:
             guard payload.count >= 2 else { return }
             let requested = Int(payload[1])
