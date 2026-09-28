@@ -9,6 +9,7 @@ import (
 )
 
 var bindMagic = []byte("RMBD")
+var rpepMagic = []byte("RPEP")
 
 const (
 	bindSideHost   = 1
@@ -76,6 +77,14 @@ func (r *udpRelay) handlePacket(b []byte, addr *net.UDPAddr) {
 		s.lastSeen = time.Now()
 		r.byAddr[addr.String()] = s
 		log.Printf("session %d: bound %s endpoint %s", id, sideName(b[12]), addr)
+
+		// If both sides are now bound, send each side the other's public endpoint
+		// for NAT hole punching.
+		if s.host != nil && s.client != nil {
+			r.sendPeerEndpoint(s.host, s.client)
+			r.sendPeerEndpoint(s.client, s.host)
+			log.Printf("session %d: sent peer endpoints for hole punching", id)
+		}
 		return
 	}
 
@@ -130,4 +139,19 @@ func sideName(side byte) string {
 		return "host"
 	}
 	return "client"
+}
+
+// sendPeerEndpoint sends a RPEP message to `to` containing the public endpoint of `peer`.
+// Format: "RPEP" (4B) + [u8 ipLen] [ip bytes] [u16 port LE]
+func (r *udpRelay) sendPeerEndpoint(to, peer *net.UDPAddr) {
+	ip := peer.IP.String()
+	ipBytes := []byte(ip)
+	msg := make([]byte, 0, 4+1+len(ipBytes)+2)
+	msg = append(msg, rpepMagic...)
+	msg = append(msg, byte(len(ipBytes)))
+	msg = append(msg, ipBytes...)
+	port := make([]byte, 2)
+	binary.LittleEndian.PutUint16(port, uint16(peer.Port))
+	msg = append(msg, port...)
+	_, _ = r.conn.WriteToUDP(msg, to)
 }

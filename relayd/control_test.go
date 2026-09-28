@@ -156,6 +156,27 @@ func TestUDPRelayForwarding(t *testing.T) {
 	bind(hostSock, bindSideHost)
 	bind(clientSock, bindSideClient)
 
+	// After both sides bind, relay sends RPEP (peer endpoint) messages.
+	// Drain them before testing forwarding.
+	drainRPEP := func(sock *net.UDPConn) {
+		sock.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		buf := make([]byte, 128)
+		for {
+			n, _, err := sock.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n >= 4 && string(buf[:4]) == "RPEP" {
+				continue
+			}
+			// Not an RPEP — put it back by testing on next read; just break.
+			break
+		}
+		sock.SetReadDeadline(time.Time{})
+	}
+	drainRPEP(hostSock)
+	drainRPEP(clientSock)
+
 	if _, err := hostSock.Write([]byte("video-frame")); err != nil {
 		t.Fatal(err)
 	}

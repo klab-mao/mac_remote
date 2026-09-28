@@ -67,6 +67,117 @@ public enum SecureInput {
     }
 }
 
+// BSD socket UDP — can send to any endpoint, used for relay + hole punching.
+final class RawUDPSocket {
+    private var fd: Int32 = -1
+    private let queue: DispatchQueue
+    private var source: DispatchSourceRead?
+    private var recvBuf = [UInt8](repeating: 0, count: 65536)
+
+    var onDatagram: ((Data) -> Void)?
+    var onState: ((String) -> Void)?
+    private(set) var localPort: UInt16 = 0
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+    }
+
+    func start() {
+        fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else {
+            onState?("socket creation failed")
+            return
+        }
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = 0
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saddr in
+                bind(fd, saddr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            onState?("bind failed")
+            Darwin.close(fd); fd = -1
+            return
+        }
+
+        var boundAddr = sockaddr_in()
+        var boundLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &boundAddr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saddr in
+                _ = getsockname(fd, saddr, &boundLen)
+            }
+        }
+        localPort = UInt16(bigEndian: boundAddr.sin_port)
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        src.setEventHandler { [weak self] in
+            self?.doReceive()
+        }
+        src.setCancelHandler { [weak self] in
+            guard let self else { return }
+            if self.fd >= 0 { Darwin.close(self.fd); self.fd = -1 }
+        }
+        src.resume()
+        source = src
+        onState?("ready (local port \(localPort))")
+    }
+
+    private func doReceive() {
+        var addr = sockaddr_in()
+        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let n = withUnsafeMutablePointer(to: &addr) { addrPtr in
+            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saddr in
+                recvfrom(fd, &recvBuf, recvBuf.count, 0, saddr, &addrLen)
+            }
+        }
+        if n > 0 {
+            onDatagram?(Data(recvBuf[0..<Int(n)]))
+        }
+    }
+
+    func sendTo(_ data: Data, host: String, port: UInt16) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard let sin = self.resolve(host: host, port: port) else {
+                self.onState?("resolve failed: \(host)")
+                return
+            }
+            data.withUnsafeBytes { ptr in
+                withUnsafePointer(to: sin) { sinPtr in
+                    sinPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saddr in
+                        _ = sendto(self.fd, ptr.baseAddress, data.count, 0,
+                                   saddr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+        }
+    }
+
+    private func resolve(host: String, port: UInt16) -> sockaddr_in? {
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_DGRAM
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(host, "\(port)", &hints, &result)
+        guard status == 0, let first = result else { return nil }
+        defer { freeaddrinfo(first) }
+        guard let aiAddr = first.pointee.ai_addr else { return nil }
+        return aiAddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+    }
+
+    func close() {
+        source?.cancel()
+        source = nil
+    }
+}
+
 public final class RelayTransport: Transport {
     public var onPacket: ((PacketHeader, Data) -> Void)?
     public var onState: ((String) -> Void)?
@@ -78,12 +189,20 @@ public final class RelayTransport: Transport {
 
     private let queue = DispatchQueue(label: "mac_remote.relay")
     private var control: NWConnection?
-    private var dataFlow: UDPFlow?
+    private var dataSocket: RawUDPSocket?
     private var buffer = Data()
     private var nonce = Data()
     private var phase: Phase = .disconnected
     private var sessionId: UInt64 = 0
+    private var relayUdpPort: UInt16 = 0
     private var pingTimer: DispatchSourceTimer?
+
+    // Hole punching state
+    private var peerHost: String?
+    private var peerPort: UInt16 = 0
+    private var directMode = false
+    private var punchTimer: DispatchSourceTimer?
+    private var punchAttempts = 0
 
     private enum Phase {
         case disconnected
@@ -172,10 +291,8 @@ public final class RelayTransport: Transport {
         case .ok:
             if phase == .awaitingAuthResult {
                 phase = .awaitingSession
-                if case .viewer = role {
-                    if case .viewer(_, let deviceId) = role {
-                        sendCtrl(.connectReq, CtrlCodec.namePayload(deviceId))
-                    }
+                if case .viewer(_, let deviceId) = role {
+                    sendCtrl(.connectReq, CtrlCodec.namePayload(deviceId))
                 }
             }
         case .err:
@@ -208,15 +325,17 @@ public final class RelayTransport: Transport {
     }
 
     private func setupDataPlane(sessionId: UInt64, udpPort: UInt16) {
-        let flow = UDPFlow(host: relayHost, port: udpPort)
-        flow.onPacket = { [weak self] header, payload in
-            self?.onPacket?(header, payload)
+        self.relayUdpPort = udpPort
+
+        let sock = RawUDPSocket(queue: queue)
+        sock.onDatagram = { [weak self] data in
+            self?.handleDataDatagram(data)
         }
-        flow.onState = { [weak self] state in
+        sock.onState = { [weak self] state in
             self?.onState?("relay data: \(state)")
         }
-        flow.start()
-        dataFlow = flow
+        sock.start()
+        dataSocket = sock
 
         var bind = Data()
         bind.append(contentsOf: Array("RMBD".utf8))
@@ -224,11 +343,84 @@ public final class RelayTransport: Transport {
         let side: UInt8
         if case .host = role { side = 1 } else { side = 2 }
         bind.append(side)
-        flow.sendDatagram(bind)
+        sock.sendTo(bind, host: relayHost, port: udpPort)
 
         phase = .established
         onState?("relay session \(sessionId) ready (udp \(udpPort))")
     }
+
+    // MARK: - Data datagram handling (RPEP, PUNCH, or mac_remote packet)
+
+    private func handleDataDatagram(_ data: Data) {
+        // RPEP: peer endpoint info from relay
+        if data.count >= 7, data[0..<4] == Data([0x52, 0x50, 0x45, 0x50]) {
+            parsePeerEndpoint(data)
+            return
+        }
+        // PUNCH: hole-punch probe from peer
+        if data.count >= 13, data[0..<5] == Data([0x50, 0x55, 0x4E, 0x43, 0x48]) {
+            onPunchReceived()
+            return
+        }
+        // Otherwise: mac_remote packet (from relay or peer)
+        if let header = PacketHeader.decode(data) {
+            let payload = data.subdata(in: PacketHeader.size..<data.count)
+            onPacket?(header, payload)
+        }
+    }
+
+    // MARK: - Hole punching
+
+    private func parsePeerEndpoint(_ data: Data) {
+        // Format: "RPEP" (4B) + [u8 ipLen] [ip bytes] [u16 port LE]
+        guard data.count >= 7 else { return }
+        let ipLen = Int(data[4])
+        guard data.count >= 5 + ipLen + 2 else { return }
+        let ip = String(data: data.subdata(in: 5..<(5 + ipLen)), encoding: .utf8) ?? ""
+        let port = UInt16(data[5 + ipLen]) | UInt16(data[5 + ipLen + 1]) << 8
+
+        peerHost = ip
+        peerPort = port
+        onState?("peer endpoint: \(ip):\(port) — starting hole punch")
+        startHolePunch()
+    }
+
+    private func startHolePunch() {
+        guard let host = peerHost else { return }
+        punchAttempts = 0
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(200))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.punchAttempts += 1
+            if self.punchAttempts > 15 {
+                self.punchTimer?.cancel()
+                self.punchTimer = nil
+                if !self.directMode {
+                    self.onState?("hole punch failed — staying on relay")
+                }
+                return
+            }
+            var punch = Data()
+            punch.append(contentsOf: Array("PUNCH".utf8))
+            punch.appendLE(self.sessionId)
+            self.dataSocket?.sendTo(punch, host: host, port: self.peerPort)
+        }
+        timer.resume()
+        punchTimer = timer
+    }
+
+    private func onPunchReceived() {
+        if !directMode {
+            directMode = true
+            punchTimer?.cancel()
+            punchTimer = nil
+            onState?("hole punch success — switched to direct mode (peer \(peerHost ?? "?"):\(peerPort))")
+        }
+    }
+
+    // MARK: - Sending
 
     private func sendCtrl(_ type: CtrlFrameType, _ payload: Data) {
         control?.send(content: CtrlCodec.frame(type, payload), completion: .contentProcessed { _ in })
@@ -244,16 +436,10 @@ public final class RelayTransport: Transport {
 
     public func sendDatagram(_ data: Data) {
         guard phase == .established else { return }
-        dataFlow?.sendDatagram(data)
-    }
-
-    public func send(type: PacketType, flags: UInt8, frameId: UInt32, fragIndex: UInt16, fragCount: UInt16, payload: Data) {
-        guard phase == .established else { return }
-        dataFlow?.send(type: type, flags: flags, frameId: frameId, fragIndex: fragIndex, fragCount: fragCount, payload: payload)
-    }
-
-    public func sendControl(_ subType: ControlSubType, extra: Data) {
-        guard phase == .established else { return }
-        dataFlow?.sendControl(subType, extra: extra)
+        if directMode, let host = peerHost {
+            dataSocket?.sendTo(data, host: host, port: peerPort)
+        } else {
+            dataSocket?.sendTo(data, host: relayHost, port: relayUdpPort)
+        }
     }
 }
