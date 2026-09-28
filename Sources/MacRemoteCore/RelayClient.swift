@@ -363,6 +363,11 @@ public final class RelayTransport: Transport {
     // MARK: - Data datagram handling (RPEP, PUNCH, or mac_remote packet)
 
     private func handleDataDatagram(_ data: Data) {
+        // Any packet from relay means bind succeeded — stop retrying
+        if bindTimer != nil {
+            bindTimer?.cancel()
+            bindTimer = nil
+        }
         // RPEP: peer endpoint info from relay
         if data.count >= 7, data[0..<4] == Data([0x52, 0x50, 0x45, 0x50]) {
             parsePeerEndpoint(data)
@@ -398,6 +403,7 @@ public final class RelayTransport: Transport {
 
     private func startHolePunch() {
         guard let host = peerHost else { return }
+        if punchTimer != nil { return }
         punchAttempts = 0
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
