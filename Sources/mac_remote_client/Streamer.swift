@@ -21,6 +21,7 @@ final class Streamer {
     private let formatLock = NSLock()
     private var pingTimer: Timer?
     private var waitingForKeyframe = false
+    private var assembledDebugCount = 0
 
     // Adaptive bitrate state
     private var maxBitrate: Int = 40
@@ -221,6 +222,10 @@ final class Streamer {
         }
         recentTotalCount += 1
         guard let avcc = assembler.push(header: header, payload: payload) else { return }
+        if isKeyframe || assembledDebugCount < 5 {
+            assembledDebugCount += 1
+            print("assembled #\(assembledDebugCount): \(avcc.count) bytes, keyframe=\(isKeyframe), frameId=\(header.frameId)")
+        }
         guard let sampleBuffer = SampleBufferFactory.makeSampleBuffer(avcc, format: format, frameId: header.frameId) else {
             return
         }
