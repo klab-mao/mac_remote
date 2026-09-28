@@ -62,7 +62,6 @@ final class HostEngine {
                 secret: relay.password
             )
             attachTransport(rt, label: "relay")
-            rt.start()
             print("Host connecting to relay \(relay.host):\(relay.controlPort) as device '\(relay.deviceId)'")
         } else {
             let l = UDPListener(port: port)
@@ -97,7 +96,7 @@ final class HostEngine {
             self?.handlePacket(header: header, payload: payload)
         }
         t.onState = { state in
-            Log.v("[\(label)] \(state)")
+            print("[\(label)] \(state)")
         }
         t.start()
         stateLock.lock()

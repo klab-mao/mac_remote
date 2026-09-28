@@ -27,7 +27,7 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let streamer = Streamer(transport: transport)
-        transport.onState = { state in Log.v("[transport] \(state)") }
+        transport.onState = { state in print("[transport] \(state)") }
 
         let screenFrame = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
         let win = BorderlessWindow(
