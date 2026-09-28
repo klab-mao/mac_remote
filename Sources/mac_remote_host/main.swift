@@ -276,9 +276,12 @@ final class HostEngine {
         stateLock.unlock()
         let datagrams = Packetizer.fragment(data, frameId: fid, isKeyframe: isKeyframe)
         let sends = isKeyframe ? 3 : 1
-        for d in datagrams {
+        for (i, d) in datagrams.enumerated() {
             for _ in 0..<sends {
                 t.sendDatagram(d)
+            }
+            if isKeyframe && i % 10 == 9 {
+                usleep(2000)
             }
         }
     }
