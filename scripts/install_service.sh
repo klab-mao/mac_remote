@@ -193,8 +193,32 @@ echo "==> Installing binary to $BIN_PATH"
 cp "$SRC_BIN" "$BIN_PATH"
 chmod +x "$BIN_PATH"
 
-echo "==> Re-signing with stable identifier ($LABEL) so TCC permissions survive rebuilds"
-codesign -f -s - --identifier "$LABEL" "$BIN_PATH"
+# ---- codesign (stable identity for TCC permissions) ---------------------------
+# Adhoc signing breaks TCC on macOS 15+. Use an Apple Development certificate
+# so Screen Recording / Accessibility permissions persist across upgrades.
+
+SIGN_IDENTITY="${SIGN_IDENTITY:-}"
+if [ -z "$SIGN_IDENTITY" ]; then
+    SIGN_IDENTITY="$(security find-identity -p codesigning -v 2>/dev/null \
+        | grep 'Apple Development' \
+        | head -1 \
+        | sed 's/^[[:space:]]*[0-9]*) \([A-Fa-f0-9]*\) .*/\1/' || true)"
+fi
+
+if [ -n "$SIGN_IDENTITY" ]; then
+    echo "==> Code signing with: $SIGN_IDENTITY"
+    security unlock-keychain -p "" "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
+    if codesign --force --timestamp=none --sign "$SIGN_IDENTITY" --identifier "$LABEL" "$BIN_PATH" 2>&1; then
+        echo "    Signed successfully"
+    else
+        echo "    WARNING: signing failed — falling back to adhoc" >&2
+        codesign --force --sign - --identifier "$LABEL" "$BIN_PATH" 2>/dev/null || true
+    fi
+else
+    echo "==> WARNING: no Apple Development certificate found — using adhoc signing" >&2
+    echo "    TCC permissions (Screen Recording/Accessibility) may not persist" >&2
+    codesign --force --sign - --identifier "$LABEL" "$BIN_PATH" 2>/dev/null || true
+fi
 
 echo "==> Writing $PLIST"
 cat > "$PLIST" <<EOF
