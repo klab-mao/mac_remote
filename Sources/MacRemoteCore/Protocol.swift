@@ -23,6 +23,7 @@ public enum ControlSubType: UInt8 {
     case nack = 12
     case screenSize = 13
     case tileNack = 14
+    case frameComplete = 15
 }
 
 public enum CodecType: UInt8 {

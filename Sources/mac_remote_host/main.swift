@@ -59,6 +59,10 @@ final class HostEngine {
             self?.handleRegion(frameId: fid, x: x, y: y, w: w, h: h, jpeg: jpeg)
         }
 
+        regionEncoder.onFrameComplete = { [weak self] fid, count in
+            self?.sendFrameComplete(frameId: fid, tileCount: count)
+        }
+
         capture.onFrame = { [weak self] pixelBuffer, time in
             guard let self else { return }
             if self.useRegionMode {
@@ -430,6 +434,7 @@ final class HostEngine {
         stateLock.unlock()
 
         var payload = Data()
+        payload.appendLE(frameId)
         payload.appendLE(x)
         payload.appendLE(y)
         payload.appendLE(w)
@@ -455,6 +460,14 @@ final class HostEngine {
         payload.append(ControlSubType.screenSize.rawValue)
         payload.appendLE(UInt16(w))
         payload.appendLE(UInt16(h))
+        sendControl { $0.send(type: .control, payload: payload) }
+    }
+
+    private func sendFrameComplete(frameId: UInt32, tileCount: Int) {
+        var payload = Data()
+        payload.append(ControlSubType.frameComplete.rawValue)
+        payload.appendLE(frameId)
+        payload.appendLE(UInt16(tileCount))
         sendControl { $0.send(type: .control, payload: payload) }
     }
 }

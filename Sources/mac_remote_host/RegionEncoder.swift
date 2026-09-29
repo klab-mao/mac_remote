@@ -7,9 +7,10 @@ import Metal
 
 final class RegionEncoder {
     var onRegion: ((UInt32, UInt16, UInt16, UInt16, UInt16, Data) -> Void)?
+    var onFrameComplete: ((UInt32, Int) -> Void)?
 
     private let tileSize = 128
-    private let jpegQuality: CGFloat = 0.35
+    private let jpegQuality: CGFloat = 0.5
     private let ciContext: CIContext = {
         if let device = MTLCreateSystemDefaultDevice() {
             return CIContext(mtlDevice: device)
@@ -27,7 +28,7 @@ final class RegionEncoder {
     private let lock = NSLock()
     private var cursorX: Int = -1
     private var cursorY: Int = -1
-    private let maxTilesPerFrame = 150
+    private let maxTilesPerFrame = 300
 
     func setup(width: Int, height: Int) {
         lock.lock()
@@ -154,6 +155,8 @@ final class RegionEncoder {
         lock.lock()
         prevPixelBuffer = pixelBuffer
         lock.unlock()
+
+        onFrameComplete?(fid, regionCount)
     }
 
     private func isTileDirty(_ curBase: UnsafeRawPointer, _ curStride: Int,
@@ -162,7 +165,7 @@ final class RegionEncoder {
         let curPtr = curBase.advanced(by: y * curStride + x * 4)
         let prevPtr = prevBase.advanced(by: y * prevStride + x * 4)
         let bytesPerRow = w * 4
-        for row in stride(from: 0, to: h, by: 4) {
+        for row in stride(from: 0, to: h, by: 2) {
             if memcmp(curPtr.advanced(by: row * curStride),
                       prevPtr.advanced(by: row * prevStride),
                       bytesPerRow) != 0 {

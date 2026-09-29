@@ -18,6 +18,10 @@ final class RegionView: NSView {
     private var infoHideTimer: Timer?
     private var tileLayers: [Int: CALayer] = [:]
     private let fullLayer = CALayer()
+    private var frameBuffers: [UInt32: [(x: Int, y: Int, cgImage: CGImage)]] = [:]
+    private var expectedTileCounts: [UInt32: Int] = [:]
+    private var flushTimer: Timer?
+    private var latestRenderedFrameId: UInt32 = 0
 
     var remoteSize: CGSize = .zero {
         didSet {
@@ -47,6 +51,10 @@ final class RegionView: NSView {
         infoLabel.layer?.backgroundColor = NSColor(white: 0, alpha: 0.65).cgColor
         infoLabel.isHidden = true
         addSubview(infoLabel)
+
+        flushTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.flushPendingTiles()
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -68,47 +76,79 @@ final class RegionView: NSView {
     }
 
     func updateRegion(x: Int, y: Int, jpegData: Data) {
-        updateRegionBatch(regions: [(x, y, jpegData)])
+        updateRegionBatch(regions: [(x, y, 0, jpegData)])
     }
 
-    func updateRegionBatch(regions: [(x: Int, y: Int, jpegData: Data)]) {
+    func updateRegionBatch(regions: [(x: Int, y: Int, frameId: UInt32, jpegData: Data)]) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            var decoded: [(x: Int, y: Int, cgImage: CGImage)] = []
-            for (x, y, jpegData) in regions {
+            var decoded: [(x: Int, y: Int, frameId: UInt32, cgImage: CGImage)] = []
+            for (x, y, frameId, jpegData) in regions {
                 guard let source = CGImageSourceCreateWithData(jpegData as CFData, nil),
                       let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { continue }
-                decoded.append((x, y, cgImage))
+                decoded.append((x, y, frameId, cgImage))
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                guard self.remoteSize.width > 0, self.remoteSize.height > 0 else { return }
-                CATransaction.begin()
-                CATransaction.setValue(kCFBooleanTrue, forKey: kCATransactionDisableActions)
-                for (x, y, cgImage) in decoded {
-                    let w = cgImage.width
-                    let h = cgImage.height
-                    if x == 0 && y == 0 && w == Int(self.remoteSize.width) && h == Int(self.remoteSize.height) {
-                        self.fullLayer.contents = cgImage
-                        print("[RegionView] full-screen JPEG received: \(w)x\(h)")
-                        continue
-                    }
-                    let key = self.tileKey(x: x, y: y)
-                    let tileLayer: CALayer
-                    if let existing = self.tileLayers[key] {
-                        tileLayer = existing
+                var immediateTiles: [(x: Int, y: Int, cgImage: CGImage)] = []
+                for (x, y, fid, cgImage) in decoded {
+                    if fid <= self.latestRenderedFrameId {
+                        immediateTiles.append((x, y, cgImage))
                     } else {
-                        tileLayer = CALayer()
-                        tileLayer.contentsGravity = .resize
-                        let flippedY = Int(self.remoteSize.height) - y - h
-                        tileLayer.frame = CGRect(x: x, y: flippedY, width: w, height: h)
-                        self.screenLayer.addSublayer(tileLayer)
-                        self.tileLayers[key] = tileLayer
+                        self.frameBuffers[fid, default: []].append((x, y, cgImage))
                     }
-                    tileLayer.contents = cgImage
                 }
-                CATransaction.commit()
+                if !immediateTiles.isEmpty {
+                    self.renderTiles(immediateTiles)
+                }
             }
+        }
+    }
+
+    func frameComplete(frameId: UInt32, expectedTiles: Int) {
+        DispatchQueue.main.async { [weak self] in
+            self?.renderFrame(frameId)
+        }
+    }
+
+    private func renderFrame(_ frameId: UInt32) {
+        guard let tiles = frameBuffers.removeValue(forKey: frameId), !tiles.isEmpty else { return }
+        expectedTileCounts.removeValue(forKey: frameId)
+        renderTiles(tiles)
+        latestRenderedFrameId = max(latestRenderedFrameId, frameId)
+    }
+
+    private func renderTiles(_ tiles: [(x: Int, y: Int, cgImage: CGImage)]) {
+        guard remoteSize.width > 0, remoteSize.height > 0 else { return }
+        CATransaction.begin()
+        CATransaction.setValue(kCFBooleanTrue, forKey: kCATransactionDisableActions)
+        for (x, y, cgImage) in tiles {
+            let w = cgImage.width
+            let h = cgImage.height
+            if x == 0 && y == 0 && w == Int(self.remoteSize.width) && h == Int(self.remoteSize.height) {
+                self.fullLayer.contents = cgImage
+                continue
+            }
+            let key = self.tileKey(x: x, y: y)
+            let tileLayer: CALayer
+            if let existing = self.tileLayers[key] {
+                tileLayer = existing
+            } else {
+                tileLayer = CALayer()
+                tileLayer.contentsGravity = .resize
+                let flippedY = Int(self.remoteSize.height) - y - h
+                tileLayer.frame = CGRect(x: x, y: flippedY, width: w, height: h)
+                self.screenLayer.addSublayer(tileLayer)
+                self.tileLayers[key] = tileLayer
+            }
+            tileLayer.contents = cgImage
+        }
+        CATransaction.commit()
+    }
+
+    private func flushPendingTiles() {
+        if let maxFid = frameBuffers.keys.max(), maxFid > latestRenderedFrameId {
+            renderFrame(maxFid)
         }
     }
 

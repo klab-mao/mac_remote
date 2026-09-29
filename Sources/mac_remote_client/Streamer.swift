@@ -7,12 +7,13 @@ import MacRemoteCore
 final class Streamer {
     var onVideoFrame: ((CMSampleBuffer) -> Void)?
     var onRegion: ((Int, Int, Data) -> Void)?
-    var onRegionBatch: (([(x: Int, y: Int, jpegData: Data)]) -> Void)?
+    var onRegionBatch: (([(x: Int, y: Int, frameId: UInt32, jpegData: Data)]) -> Void)?
     var onRemoteSize: ((CGSize) -> Void)?
     var onFirstFrame: (() -> Void)?
     var onDisplayInfo: ((Int, Int) -> Void)?
     var onUnlockResult: ((UnlockResultCode) -> Void)?
     var onLockState: ((Bool) -> Void)?
+    var onFrameComplete: ((UInt32, Int) -> Void)?
 
     private let transport: Transport
     private let assembler = FrameAssembler()
@@ -152,6 +153,11 @@ final class Streamer {
             let w = UInt16(payload[1]) | UInt16(payload[2]) << 8
             let h = UInt16(payload[3]) | UInt16(payload[4]) << 8
             onRemoteSize?(CGSize(width: CGFloat(w), height: CGFloat(h)))
+        case .frameComplete:
+            guard payload.count >= 7 else { return }
+            let fid = UInt32(payload[1]) | UInt32(payload[2]) << 8 | UInt32(payload[3]) << 16 | UInt32(payload[4]) << 24
+            let tileCount = Int(payload[5]) | Int(payload[6]) << 8
+            onFrameComplete?(fid, tileCount)
         default:
             break
         }
@@ -306,9 +312,8 @@ final class Streamer {
                 let scanEnd = maxTileSeq - 5
                 var s = scanStart
                 while s < scanEnd && missing.count < 20 {
-                    if !recentTileSeqs.contains(s) && !tileNackSent.contains(s) {
+                    if !recentTileSeqs.contains(s) {
                         missing.append(s)
-                        tileNackSent.insert(s)
                     }
                     s &+= 1
                 }
@@ -326,9 +331,11 @@ final class Streamer {
             tileNackSent = tileNackSent.filter { $0 > cutoff }
         }
 
-        var regions: [(x: Int, y: Int, jpegData: Data)] = []
+        var regions: [(x: Int, y: Int, frameId: UInt32, jpegData: Data)] = []
         var offset = 0
-        while offset + 12 <= payload.count {
+        while offset + 16 <= payload.count {
+            let frameId = UInt32(payload[offset]) | UInt32(payload[offset + 1]) << 8 | UInt32(payload[offset + 2]) << 16 | UInt32(payload[offset + 3]) << 24
+            offset += 4
             let x = UInt16(payload[offset]) | UInt16(payload[offset + 1]) << 8
             let y = UInt16(payload[offset + 2]) | UInt16(payload[offset + 3]) << 8
             offset += 8
@@ -341,13 +348,13 @@ final class Streamer {
                 receivedFirstFrame = true
                 onFirstFrame?()
             }
-            regions.append((Int(x), Int(y), jpegData))
+            regions.append((Int(x), Int(y), frameId, jpegData))
         }
         if !regions.isEmpty {
             if let onRegionBatch = onRegionBatch {
                 onRegionBatch(regions)
             } else {
-                for (x, y, jpeg) in regions {
+                for (x, y, _, jpeg) in regions {
                     onRegion?(x, y, jpeg)
                 }
             }

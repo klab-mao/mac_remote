@@ -70,6 +70,11 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
                 }
                 view?.updateRegionBatch(regions: regions)
             }
+            if let rv = view as? RegionView {
+                streamer.onFrameComplete = { [weak rv] fid, count in
+                    rv?.frameComplete(frameId: fid, expectedTiles: count)
+                }
+            }
         } else {
             let view = VideoView(frame: NSRect(origin: .zero, size: screenFrame.size))
             win.contentView = view
