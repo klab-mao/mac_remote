@@ -10,6 +10,8 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
 
     private var window: BorderlessWindow?
     private var videoView: VideoView?
+    private var regionView: RegionView?
+    private var remoteView: (any RemoteScreenView)?
     private var streamer: Streamer?
     private var inputSender: InputSender?
     private var keyframeTimer: Timer?
@@ -17,11 +19,14 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
     private var reconnectTimer: Timer?
     private var frameCount = 0
     private var lastFrameTime = Date()
+    private var lastRemoteSize: CGSize = .zero
     private var isReconnecting = false
+    private let useRegionMode: Bool
 
-    init(transport: Transport, modeLabel: String) {
+    init(transport: Transport, modeLabel: String, useRegionMode: Bool) {
         self.transport = transport
         self.modeLabel = modeLabel
+        self.useRegionMode = useRegionMode
         super.init()
     }
 
@@ -36,39 +41,64 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        let view = VideoView(frame: NSRect(origin: .zero, size: screenFrame.size))
-        win.contentView = view
         win.isOpaque = true
         win.backgroundColor = .black
         win.collectionBehavior = [.fullScreenAuxiliary]
         win.title = "mac_remote"
-
         window = win
-        videoView = view
 
-        streamer.onRemoteSize = { [weak view] size in
-            view?.remoteSize = size
-        }
+        if useRegionMode {
+            let view = RegionView(frame: NSRect(origin: .zero, size: screenFrame.size))
+            win.contentView = view
+            regionView = view
+            remoteView = view
 
-        streamer.onVideoFrame = { [weak self, weak view] sampleBuffer in
-            guard let self, let view else { return }
-            self.frameCount += 1
-            self.lastFrameTime = Date()
-            if self.isReconnecting {
-                self.isReconnecting = false
-                print("Reconnected — video resumed")
-            }
-            let layer = view.displayLayer
-            DispatchQueue.main.async {
-                if layer.status == .failed {
-                    print("displayLayer FAILED, flushing + marking decoder failed")
-                    layer.flush()
-                    self.streamer?.markDecoderFailed()
-                    return
+            streamer.onRemoteSize = { [weak self, weak view] size in
+                view?.remoteSize = size
+                if size.width > 0, size.height > 0, size != self?.lastRemoteSize {
+                    self?.lastRemoteSize = size
+                    self?.streamer?.requestKeyframe()
                 }
-                layer.enqueue(sampleBuffer)
-                if self.frameCount <= 3 {
-                    print("enqueue #\(self.frameCount): layer.status=\(layer.status) frame=\(layer.frame)")
+            }
+            streamer.onRegionBatch = { [weak self, weak view] regions in
+                guard let self else { return }
+                self.frameCount += regions.count
+                self.lastFrameTime = Date()
+                if self.isReconnecting {
+                    self.isReconnecting = false
+                    print("Reconnected — video resumed")
+                }
+                view?.updateRegionBatch(regions: regions)
+            }
+        } else {
+            let view = VideoView(frame: NSRect(origin: .zero, size: screenFrame.size))
+            win.contentView = view
+            videoView = view
+            remoteView = view
+
+            streamer.onRemoteSize = { [weak view] size in
+                view?.remoteSize = size
+            }
+            streamer.onVideoFrame = { [weak self, weak view] sampleBuffer in
+                guard let self, let view else { return }
+                self.frameCount += 1
+                self.lastFrameTime = Date()
+                if self.isReconnecting {
+                    self.isReconnecting = false
+                    print("Reconnected — video resumed")
+                }
+                let layer = view.displayLayer
+                DispatchQueue.main.async {
+                    if layer.status == .failed {
+                        print("displayLayer FAILED, flushing + marking decoder failed")
+                        layer.flush()
+                        self.streamer?.markDecoderFailed()
+                        return
+                    }
+                    layer.enqueue(sampleBuffer)
+                    if self.frameCount <= 3 {
+                        print("enqueue #\(self.frameCount): layer.status=\(layer.status) frame=\(layer.frame)")
+                    }
                 }
             }
         }
@@ -80,9 +110,9 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        streamer.onDisplayInfo = { [weak view] current, total in
+        streamer.onDisplayInfo = { [weak self] current, total in
             DispatchQueue.main.async {
-                view?.showDisplayInfo(current: current, total: total)
+                self?.remoteView?.showDisplayInfo(current: current, total: total)
             }
         }
 
@@ -96,17 +126,17 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
                 case .unsupportedCharacter: msg = "Password contains characters unsupported by the US key mapping"
                 case .error: msg = "Unlock error (empty password?)"
                 }
-                self?.videoView?.showStatus(msg, hideAfter: 5)
+                self?.remoteView?.showStatus(msg, hideAfter: 5)
             }
         }
 
-        streamer.onLockState = { [weak view] isLocked in
+        streamer.onLockState = { [weak self] isLocked in
             DispatchQueue.main.async {
-                view?.showStatus(isLocked ? "Remote screen locked" : "Remote screen unlocked")
+                self?.remoteView?.showStatus(isLocked ? "Remote screen locked" : "Remote screen unlocked", hideAfter: 2.5)
             }
         }
 
-        let sender = InputSender(streamer: streamer, view: view)
+        let sender = InputSender(streamer: streamer, view: remoteView!)
         sender.onCycleDisplay = { [weak streamer] in
             streamer?.sendSwitchDisplay(index: 255)
         }
@@ -135,8 +165,12 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let fps = self.frameCount
             self.frameCount = 0
-            let layer = self.videoView?.displayLayer
-            print("fps: \(fps) layer.status=\(layer?.status ?? .unknown) frame=\(String(describing: layer?.frame))")
+            if self.useRegionMode {
+                print("fps: \(fps)")
+            } else {
+                let layer = self.videoView?.displayLayer
+                print("fps: \(fps) layer.status=\(layer?.status ?? .unknown) frame=\(String(describing: layer?.frame))")
+            }
         }
 
         reconnectTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -163,7 +197,7 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
         alert.window.initialFirstResponder = field
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return }
-        videoView?.showStatus("Unlocking...", hideAfter: nil)
+        remoteView?.showStatus("Unlocking...", hideAfter: nil)
         streamer?.sendUnlock(password: field.stringValue)
     }
 
@@ -176,6 +210,7 @@ struct ClientConfig {
     var transport: Transport
     var modeLabel: String
     var debug: Bool
+    var useRegionMode: Bool
 }
 
 func parseClientArgs() -> ClientConfig? {
@@ -235,12 +270,12 @@ func parseClientArgs() -> ClientConfig? {
             role: .viewer(username: u, deviceId: id),
             secret: pass ?? ""
         )
-        return ClientConfig(transport: rt, modeLabel: "relay \(rh):\(relayPort) as \(u) -> \(id)", debug: debug)
+        return ClientConfig(transport: rt, modeLabel: "relay \(rh):\(relayPort) as \(u) -> \(id)", debug: debug, useRegionMode: true)
     }
 
     guard let h = host else { return nil }
     let flow = UDPFlow(host: h, port: port)
-    return ClientConfig(transport: flow, modeLabel: "direct \(h):\(port)", debug: debug)
+    return ClientConfig(transport: flow, modeLabel: "direct \(h):\(port)", debug: debug, useRegionMode: false)
 }
 
 let clientConfig = parseClientArgs()
@@ -259,7 +294,7 @@ Log.verbose = cfg.debug
 print("Connecting via \(cfg.modeLabel)")
 
 let app = NSApplication.shared
-let delegate = ClientDelegate(transport: cfg.transport, modeLabel: cfg.modeLabel)
+let delegate = ClientDelegate(transport: cfg.transport, modeLabel: cfg.modeLabel, useRegionMode: cfg.useRegionMode)
 app.delegate = delegate
 app.setActivationPolicy(.regular)
 app.run()

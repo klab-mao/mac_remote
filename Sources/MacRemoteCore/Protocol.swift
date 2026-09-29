@@ -4,6 +4,7 @@ public enum PacketType: UInt8 {
     case video = 0
     case input = 1
     case control = 2
+    case region = 3
 }
 
 public enum ControlSubType: UInt8 {
@@ -20,6 +21,8 @@ public enum ControlSubType: UInt8 {
     case pong = 10
     case setBitrate = 11
     case nack = 12
+    case screenSize = 13
+    case tileNack = 14
 }
 
 public enum CodecType: UInt8 {
@@ -213,25 +216,25 @@ public enum Packetizer {
 }
 
 extension Data {
-    mutating func appendLE(_ v: UInt16) {
+    public mutating func appendLE(_ v: UInt16) {
         append(UInt8(v & 0xff))
         append(UInt8(v >> 8))
     }
 
-    mutating func appendLE(_ v: UInt32) {
+    public mutating func appendLE(_ v: UInt32) {
         append(UInt8(v & 0xff))
         append(UInt8((v >> 8) & 0xff))
         append(UInt8((v >> 16) & 0xff))
         append(UInt8((v >> 24) & 0xff))
     }
 
-    mutating func appendLE(_ v: UInt64) {
+    public mutating func appendLE(_ v: UInt64) {
         for i in 0..<8 {
             append(UInt8((v >> (8 * i)) & 0xff))
         }
     }
 
-    mutating func appendLE(_ v: Float) {
+    public mutating func appendLE(_ v: Float) {
         Swift.withUnsafeBytes(of: v.bitPattern.littleEndian) { append(contentsOf: $0) }
     }
 }

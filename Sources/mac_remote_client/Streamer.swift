@@ -6,6 +6,8 @@ import MacRemoteCore
 
 final class Streamer {
     var onVideoFrame: ((CMSampleBuffer) -> Void)?
+    var onRegion: ((Int, Int, Data) -> Void)?
+    var onRegionBatch: (([(x: Int, y: Int, jpegData: Data)]) -> Void)?
     var onRemoteSize: ((CGSize) -> Void)?
     var onFirstFrame: (() -> Void)?
     var onDisplayInfo: ((Int, Int) -> Void)?
@@ -24,6 +26,10 @@ final class Streamer {
     private var assembledDebugCount = 0
     private var kfFragCount = 0
     private var nackSentFrames: Set<UInt32> = []
+    private var maxTileSeq: UInt32 = 0
+    private var recentTileSeqs: Set<UInt32> = []
+    private var tileNackSent: Set<UInt32> = []
+    private var tilesSinceLastNackCheck = 0
 
     // Adaptive bitrate state
     private var maxBitrate: Int = 10
@@ -84,6 +90,18 @@ final class Streamer {
         print("NACK: requesting \(missing.count) fragments for frameId=\(frameId)")
     }
 
+    private func sendTileNack(_ missingSeqs: [UInt32]) {
+        var extra = Data()
+        extra.append(UInt8(missingSeqs.count))
+        for seq in missingSeqs {
+            extra.append(UInt8(seq & 0xff))
+            extra.append(UInt8((seq >> 8) & 0xff))
+            extra.append(UInt8((seq >> 16) & 0xff))
+            extra.append(UInt8((seq >> 24) & 0xff))
+        }
+        transport.sendControl(.tileNack, extra: extra)
+    }
+
     func markDecoderFailed() {
         waitingForKeyframe = true
         requestKeyframe()
@@ -107,13 +125,14 @@ final class Streamer {
         switch header.type {
         case .video:
             handleVideo(header: header, payload: payload)
+        case .region:
+            handleRegionPacket(header: header, payload: payload)
         case .control:
             handleControl(payload: payload)
         case .input:
             break
         }
     }
-
     private func handleControl(payload: Data) {
         guard let subType = ControlSubType(rawValue: payload.first ?? 255) else { return }
         switch subType {
@@ -128,6 +147,11 @@ final class Streamer {
         case .lockState:
             guard payload.count >= 2 else { return }
             onLockState?(payload[1] != 0)
+        case .screenSize:
+            guard payload.count >= 5 else { return }
+            let w = UInt16(payload[1]) | UInt16(payload[2]) << 8
+            let h = UInt16(payload[3]) | UInt16(payload[4]) << 8
+            onRemoteSize?(CGSize(width: CGFloat(w), height: CGFloat(h)))
         default:
             break
         }
@@ -265,6 +289,71 @@ final class Streamer {
             onFirstFrame?()
         }
         onVideoFrame?(sampleBuffer)
+    }
+
+    private func handleRegionPacket(header: PacketHeader, payload: Data) {
+        let seq = header.frameId
+        recentTileSeqs.insert(seq)
+        if seq > maxTileSeq {
+            maxTileSeq = seq
+        }
+        tilesSinceLastNackCheck += 1
+        if tilesSinceLastNackCheck >= 30 {
+            tilesSinceLastNackCheck = 0
+            if maxTileSeq > 20 {
+                var missing: [UInt32] = []
+                let scanStart = maxTileSeq > 200 ? maxTileSeq - 200 : 1
+                let scanEnd = maxTileSeq - 10
+                var s = scanStart
+                while s < scanEnd && missing.count < 20 {
+                    if !recentTileSeqs.contains(s) && !tileNackSent.contains(s) {
+                        missing.append(s)
+                        tileNackSent.insert(s)
+                    }
+                    s &+= 1
+                }
+                if !missing.isEmpty {
+                    sendTileNack(missing)
+                }
+            }
+        }
+        if recentTileSeqs.count > 300 {
+            let cutoff = maxTileSeq &- 300
+            recentTileSeqs = recentTileSeqs.filter { $0 > cutoff }
+        }
+        if tileNackSent.count > 300 {
+            let cutoff = maxTileSeq &- 300
+            tileNackSent = tileNackSent.filter { $0 > cutoff }
+        }
+
+        var regions: [(x: Int, y: Int, jpegData: Data)] = []
+        var offset = 0
+        while offset + 12 <= payload.count {
+            let x = UInt16(payload[offset]) | UInt16(payload[offset + 1]) << 8
+            let y = UInt16(payload[offset + 2]) | UInt16(payload[offset + 3]) << 8
+            offset += 8
+            let jpegLen = Int(UInt32(payload[offset]) | UInt32(payload[offset + 1]) << 8 | UInt32(payload[offset + 2]) << 16 | UInt32(payload[offset + 3]) << 24)
+            offset += 4
+            guard offset + jpegLen <= payload.count, jpegLen > 0 else { break }
+            let jpegData = payload.subdata(in: offset..<(offset + jpegLen))
+            offset += jpegLen
+            if !receivedFirstFrame {
+                receivedFirstFrame = true
+                onFirstFrame?()
+            }
+            regions.append((Int(x), Int(y), jpegData))
+        }
+        if !regions.isEmpty {
+            if let onRegionBatch = onRegionBatch {
+                onRegionBatch(regions)
+            } else {
+                for (x, y, jpeg) in regions {
+                    onRegion?(x, y, jpeg)
+                }
+            }
+        } else if payload.count > 0 {
+            print("[streamer] region packet: 0 regions from \(payload.count) bytes")
+        }
     }
 
     // Called by FrameAssembler when a frame is dropped due to missing fragments.

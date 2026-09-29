@@ -50,7 +50,7 @@ final class H264Encoder {
         codecType = codec
 
         let profileLevel: CFString = codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel
-        let props: [CFString: Any] = [
+        var props: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_ProfileLevel: profileLevel,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
@@ -60,6 +60,9 @@ final class H264Encoder {
             kVTCompressionPropertyKey_MaxKeyFrameInterval: fps * 2,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2.0
         ]
+        if codec == .h264 {
+            props[kVTCompressionPropertyKey_H264EntropyMode] = kVTH264EntropyMode_CABAC
+        }
         for (key, value) in props {
             VTSessionSetProperty(s, key: key, value: value as CFTypeRef)
         }

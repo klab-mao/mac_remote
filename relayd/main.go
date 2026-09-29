@@ -72,9 +72,11 @@ func main() {
 	log.Printf("relayd listening: control tcp/:%d, data udp/:%d", *ctrlPort, *udpPort)
 
 	hub := &controlHub{
-		accounts: accounts,
-		relay:    relay,
-		hosts:    map[string]net.Conn{},
+		accounts:      accounts,
+		relay:         relay,
+		hosts:         map[string]net.Conn{},
+		tcpSessions:   map[uint64]*tcpSession{},
+		sessionByConn: map[net.Conn]uint64{},
 	}
 
 	for {

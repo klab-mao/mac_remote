@@ -23,30 +23,68 @@ const (
 	frSessionInfo uint16 = 7
 	frPing        uint16 = 8
 	frPong        uint16 = 9
+	frData        uint16 = 10
 )
 
 const (
 	authTimeout  = 15 * time.Second
 	idleTimeout  = 120 * time.Second
-	maxFrameSize = 1 << 20
+	maxFrameSize = 4 << 20
 )
 
+type tcpSession struct {
+	hostConn     net.Conn
+	viewerConn   net.Conn
+	hostDeviceID string
+	writeCh      chan []byte
+	done         chan struct{}
+}
+
 type controlHub struct {
-	mu       sync.Mutex
-	accounts *Accounts
-	relay    *udpRelay
-	hosts    map[string]net.Conn
+	mu            sync.Mutex
+	accounts      *Accounts
+	relay         *udpRelay
+	hosts         map[string]net.Conn
+	tcpSessions   map[uint64]*tcpSession
+	sessionByConn map[net.Conn]uint64
 }
 
 func (h *controlHub) registerHost(deviceID string, conn net.Conn) {
 	h.mu.Lock()
 	h.hosts[deviceID] = conn
+	type resendItem struct {
+		sid  uint64
+		conn net.Conn
+	}
+	var resends []resendItem
+	for sid, ts := range h.tcpSessions {
+		if ts.hostDeviceID == deviceID && ts.hostConn != conn {
+			if ts.hostConn != nil {
+				delete(h.sessionByConn, ts.hostConn)
+			}
+			ts.hostConn = conn
+			h.sessionByConn[conn] = sid
+			resends = append(resends, resendItem{sid, conn})
+		}
+	}
 	h.mu.Unlock()
+	for _, r := range resends {
+		info := make([]byte, 10)
+		binary.LittleEndian.PutUint64(info, r.sid)
+		binary.LittleEndian.PutUint16(info[8:], uint16(h.relay.port))
+		if err := writeFrame(r.conn, frSessionInfo, info); err != nil {
+			log.Printf("re-send sessionInfo error: %v", err)
+		} else {
+			log.Printf("re-sent sessionInfo %d to reconnected host %s", r.sid, deviceID)
+		}
+	}
 }
 
-func (h *controlHub) unregisterHost(deviceID string) {
+func (h *controlHub) unregisterHost(deviceID string, conn net.Conn) {
 	h.mu.Lock()
-	delete(h.hosts, deviceID)
+	if h.hosts[deviceID] == conn {
+		delete(h.hosts, deviceID)
+	}
 	h.mu.Unlock()
 }
 
@@ -80,6 +118,7 @@ func handleControl(conn net.Conn, hub *controlHub) {
 		switch typ {
 		case frPing:
 			_ = writeFrame(conn, frPong, nil)
+			log.Printf("ping from %s — pong sent", conn.RemoteAddr())
 
 		case frAuthHost:
 			name, err = verifyAuth(payload, nonce, hub.accounts.Hosts)
@@ -131,7 +170,61 @@ func handleControl(conn net.Conn, hub *controlHub) {
 				_ = writeFrame(conn, frErr, strPayload("host unreachable"))
 				break
 			}
+			writeCh := make(chan []byte, 60)
+			done := make(chan struct{})
+			hub.mu.Lock()
+			hub.tcpSessions[sessionID] = &tcpSession{hostConn: hostConn, viewerConn: conn, hostDeviceID: deviceID, writeCh: writeCh, done: done}
+			hub.sessionByConn[hostConn] = sessionID
+			hub.sessionByConn[conn] = sessionID
+			hub.mu.Unlock()
+			go func() {
+				for {
+					select {
+					case data := <-writeCh:
+						if err := writeFrame(conn, frData, data); err != nil {
+							log.Printf("frData forward error (viewer): %v", err)
+							return
+						}
+					case <-done:
+						return
+					}
+				}
+			}()
 			log.Printf("session %d opened: %s -> %s", sessionID, name, deviceID)
+
+		case frData:
+			hub.mu.Lock()
+			sid, ok := hub.sessionByConn[conn]
+			var writeCh chan []byte
+			var dst net.Conn
+			if ok {
+				ts := hub.tcpSessions[sid]
+				if ts != nil {
+					if ts.hostConn == conn {
+						writeCh = ts.writeCh
+					} else {
+						dst = ts.hostConn
+					}
+				}
+			}
+			hub.mu.Unlock()
+			if writeCh != nil {
+				payloadCopy := make([]byte, len(payload))
+				copy(payloadCopy, payload)
+				select {
+				case writeCh <- payloadCopy:
+				default:
+					log.Printf("frData dropped: viewer buffer full (sid=%d)", sid)
+				}
+			} else if dst != nil {
+				payloadCopy := make([]byte, len(payload))
+				copy(payloadCopy, payload)
+				if err := writeFrame(dst, frData, payloadCopy); err != nil {
+					log.Printf("frData forward error: %v (dst=%v)", err, dst.RemoteAddr())
+				}
+			} else {
+				log.Printf("frData no dst: sid=%d ok=%v from=%v len=%d", sid, ok, conn.RemoteAddr(), len(payload))
+			}
 
 		default:
 			// ignore unknown frames for forward compatibility
@@ -139,9 +232,26 @@ func handleControl(conn net.Conn, hub *controlHub) {
 	}
 
 	if authed && role == "host" {
-		hub.unregisterHost(name)
+		hub.unregisterHost(name, conn)
 		log.Printf("host device went offline: %s", name)
 	}
+	hub.mu.Lock()
+	if sid, ok := hub.sessionByConn[conn]; ok {
+		delete(hub.sessionByConn, conn)
+		if ts := hub.tcpSessions[sid]; ts != nil {
+			if ts.hostConn == conn {
+				ts.hostConn = nil
+			} else if ts.viewerConn == conn {
+				ts.viewerConn = nil
+				ts.writeCh = nil
+				close(ts.done)
+			}
+			if ts.hostConn == nil && ts.viewerConn == nil {
+				delete(hub.tcpSessions, sid)
+			}
+		}
+	}
+	hub.mu.Unlock()
 }
 
 func verifyAuth(payload, nonce []byte, expected map[string]string) (string, error) {

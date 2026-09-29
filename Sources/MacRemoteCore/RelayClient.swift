@@ -18,6 +18,7 @@ enum CtrlFrameType: UInt16 {
     case sessionInfo = 7
     case ping = 8
     case pong = 9
+    case data = 10
 }
 
 enum CtrlCodec {
@@ -153,11 +154,14 @@ final class RawUDPSocket {
                 withUnsafePointer(to: sin) { sinPtr in
                     sinPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saddr in
                         var retries = 0
+                        var sent = false
                         while retries < 20 {
                             let result = sendto(self.fd, ptr.baseAddress, data.count, 0,
                                                saddr, socklen_t(MemoryLayout<sockaddr_in>.size))
-                            if result >= 0 { break }
-                            if errno != EAGAIN && errno != ENOBUFS { break }
+                            if result >= 0 { sent = true; break }
+                            if errno != EAGAIN && errno != ENOBUFS {
+                                break
+                            }
                             usleep(500)
                             retries += 1
                         }
@@ -203,6 +207,7 @@ public final class RelayTransport: Transport {
     private var sessionId: UInt64 = 0
     private var relayUdpPort: UInt16 = 0
     private var pingTimer: DispatchSourceTimer?
+    private var lastPongTime: Date = .distantFuture
 
     // Hole punching state
     private var peerHost: String?
@@ -274,17 +279,24 @@ public final class RelayTransport: Transport {
     }
 
     private func startPingTimer() {
+        lastPongTime = Date()
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 10, repeating: 10)
+        timer.schedule(deadline: .now() + 5, repeating: 5)
         timer.setEventHandler { [weak self] in
-            self?.sendCtrl(.ping, Data())
+            guard let self else { return }
+            self.sendCtrl(.ping, Data())
+            let elapsed = Date().timeIntervalSince(self.lastPongTime)
+            if elapsed > 20 {
+                self.onState?("relay pong timeout (\(Int(elapsed))s) — forcing reconnect")
+                self.reconnect()
+            }
         }
         timer.resume()
         pingTimer = timer
     }
 
     private func scheduleControlReceive() {
-        control?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+        control?.receive(minimumIncompleteLength: 1, maximumLength: 262144) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data, !data.isEmpty {
                 self.buffer.append(data)
@@ -308,7 +320,9 @@ public final class RelayTransport: Transport {
             guard buffer.count >= total else { return }
             let payload = buffer.subdata(in: (buffer.startIndex + CtrlCodec.headerSize)..<(buffer.startIndex + total))
             buffer.removeSubrange(buffer.startIndex..<(buffer.startIndex + total))
-            guard let type = CtrlFrameType(rawValue: typeRaw) else { continue }
+            guard let type = CtrlFrameType(rawValue: typeRaw) else {
+                continue
+            }
             handleCtrl(type, payload)
         }
     }
@@ -338,7 +352,14 @@ public final class RelayTransport: Transport {
             let udpPort = UInt16(payload[8]) | UInt16(payload[9]) << 8
             setupDataPlane(sessionId: sessionId, udpPort: udpPort)
         case .pong:
-            break
+            lastPongTime = Date()
+        case .data:
+            if let header = PacketHeader.decode(payload) {
+                let packetPayload = payload.subdata(in: PacketHeader.size..<payload.count)
+                onPacket?(header, packetPayload)
+            } else {
+                print("[relay] data decode failed: \(payload.count) bytes")
+            }
         default:
             break
         }
@@ -390,6 +411,8 @@ public final class RelayTransport: Transport {
 
     // MARK: - Data datagram handling (RPEP, PUNCH, or mac_remote packet)
 
+    private let fragAssembler = UDPFragAssembler()
+
     private func handleDataDatagram(_ data: Data) {
         // Keep bind timer running to refresh NAT mapping and relay address record
         // RPEP: peer endpoint info from relay
@@ -405,7 +428,14 @@ public final class RelayTransport: Transport {
         // Otherwise: mac_remote packet (from relay or peer)
         if let header = PacketHeader.decode(data) {
             let payload = data.subdata(in: PacketHeader.size..<data.count)
-            onPacket?(header, payload)
+            if header.fragCount > 1 {
+                if let complete = fragAssembler.push(header: header, payload: payload) {
+                    let completeHeader = PacketHeader(type: header.type, flags: header.flags, frameId: header.frameId, fragIndex: 0, fragCount: 1, payloadLength: UInt32(complete.count))
+                    onPacket?(completeHeader, complete)
+                }
+            } else {
+                onPacket?(header, payload)
+            }
         }
     }
 
@@ -478,6 +508,62 @@ public final class RelayTransport: Transport {
 
     public func sendDatagram(_ data: Data) {
         guard phase == .established else { return }
-        dataSocket?.sendTo(data, host: relayHost, port: relayUdpPort)
+        
+        if let header = PacketHeader.decode(data), header.type == .control {
+            sendCtrl(.data, data)
+            return
+        }
+        
+        guard let header = PacketHeader.decode(data) else {
+            sendCtrl(.data, data)
+            return
+        }
+        let payload = data.subdata(in: PacketHeader.size..<data.count)
+        
+        let maxFragPayload = 1200 - PacketHeader.size
+        if payload.count <= maxFragPayload {
+            dataSocket?.sendTo(data, host: relayHost, port: relayUdpPort)
+            return
+        }
+        
+        let fragCount = UInt16((payload.count + maxFragPayload - 1) / maxFragPayload)
+        for i in 0..<fragCount {
+            let start = Int(i) * maxFragPayload
+            let end = min(start + maxFragPayload, payload.count)
+            let fragPayload = payload.subdata(in: start..<end)
+            let fragHeader = PacketHeader(type: header.type, flags: header.flags, frameId: header.frameId, fragIndex: i, fragCount: fragCount, payloadLength: UInt32(fragPayload.count))
+            var fragData = fragHeader.encode()
+            fragData.append(fragPayload)
+            dataSocket?.sendTo(fragData, host: relayHost, port: relayUdpPort)
+        }
+    }
+}
+
+private final class UDPFragAssembler {
+    private var frames: [UInt32: (count: UInt16, parts: [UInt16: Data])] = [:]
+    private let lock = NSLock()
+    
+    func push(header: PacketHeader, payload: Data) -> Data? {
+        guard header.fragCount > 1 else { return payload }
+        
+        lock.lock()
+        defer { lock.unlock() }
+        
+        var frame = frames[header.frameId] ?? (count: header.fragCount, parts: [:])
+        frame.parts[header.fragIndex] = payload
+        frames[header.frameId] = frame
+        
+        guard frame.parts.count == Int(frame.count) else { return nil }
+        
+        var complete = Data()
+        for i in 0..<frame.count {
+            guard let part = frame.parts[i] else {
+                frames.removeValue(forKey: header.frameId)
+                return nil
+            }
+            complete.append(part)
+        }
+        frames.removeValue(forKey: header.frameId)
+        return complete
     }
 }

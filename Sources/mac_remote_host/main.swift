@@ -23,6 +23,8 @@ final class HostEngine {
     private var lastClientActivity: Date = .distantPast
     private var clientTimedOut = false
     private var keyframeBuffer: [UInt32: [Data]] = [:]
+    private let regionEncoder = RegionEncoder()
+    private var useRegionMode = false
 
     struct RelaySpec {
         var host: String
@@ -47,12 +49,23 @@ final class HostEngine {
             self?.sendLockState()
         }
 
+        useRegionMode = relay != nil
+
         encoder.onEncodedFrame = { [weak self] data, isKeyframe, paramSets in
             self?.handleEncoded(data: data, isKeyframe: isKeyframe, paramSets: paramSets)
         }
 
+        regionEncoder.onRegion = { [weak self] fid, x, y, w, h, jpeg in
+            self?.handleRegion(frameId: fid, x: x, y: y, w: w, h: h, jpeg: jpeg)
+        }
+
         capture.onFrame = { [weak self] pixelBuffer, time in
-            self?.encoder.encode(pixelBuffer, time: time)
+            guard let self else { return }
+            if self.useRegionMode {
+                self.regionEncoder.encode(pixelBuffer)
+            } else {
+                self.encoder.encode(pixelBuffer, time: time)
+            }
         }
 
         if let relay {
@@ -79,7 +92,14 @@ final class HostEngine {
                 do {
                     let (w, h) = try await self.capture.prepare(displayIndex: self.displayIndex, fps: self.fps)
                     self.currentDisplayID = self.capture.displays[self.capture.currentIndex].displayID
-                    try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps, codec: self.codec)
+                    if self.useRegionMode {
+                        self.regionEncoder.setup(width: w, height: h)
+                        stateLock.lock()
+                        self.pendingScreenSize = true
+                        stateLock.unlock()
+                    } else {
+                        try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps, codec: self.codec)
+                    }
                     try await self.capture.beginStream()
                     break
                 } catch {
@@ -105,6 +125,7 @@ final class HostEngine {
         stateLock.unlock()
     }
 
+    private var pendingScreenSize = false
     private func handlePacket(header: PacketHeader, payload: Data) {
         stateLock.lock()
         lastClientActivity = Date()
@@ -113,7 +134,11 @@ final class HostEngine {
         stateLock.unlock()
         if wasTimedOut {
             print("Client activity resumed, video unpaused")
-            encoder.forceKeyFrame()
+            if useRegionMode {
+                regionEncoder.forceFullFrame()
+            } else {
+                encoder.forceKeyFrame()
+            }
         }
 
         switch header.type {
@@ -121,7 +146,7 @@ final class HostEngine {
             handleControl(payload: payload)
         case .input:
             handleInput(payload: payload)
-        case .video:
+        case .video, .region:
             break
         }
     }
@@ -131,11 +156,22 @@ final class HostEngine {
         switch subType {
         case .hello:
             sendControl { $0.sendControl(.helloAck) }
-            encoder.forceKeyFrame()
+            if useRegionMode {
+                stateLock.lock()
+                pendingScreenSize = true
+                stateLock.unlock()
+                regionEncoder.forceFullFrame()
+            } else {
+                encoder.forceKeyFrame()
+            }
             sendDisplayInfo()
-            print("Client registered, keyframe forced")
+            print("Client registered, \(useRegionMode ? "full frame forced" : "keyframe forced")")
         case .keyframeRequest:
-            encoder.forceKeyFrame()
+            if useRegionMode {
+                regionEncoder.forceFullFrame()
+            } else {
+                encoder.forceKeyFrame()
+            }
         case .setBitrate:
             guard payload.count >= 2 else { return }
             let mbps = Int(payload[1])
@@ -159,6 +195,8 @@ final class HostEngine {
             sendControl { $0.sendControl(.pong) }
         case .nack:
             handleNack(payload: payload)
+        case .tileNack:
+            handleTileNack(payload: payload)
         default:
             break
         }
@@ -184,6 +222,31 @@ final class HostEngine {
         }
         if retransmitted > 0 {
             Log.v("NACK: retransmitted \(retransmitted)/\(count) fragments for frameId=\(frameId)")
+        }
+    }
+
+    private func handleTileNack(payload: Data) {
+        guard payload.count >= 2 else { return }
+        let count = Int(payload[1])
+        guard count > 0, payload.count >= 2 + count * 4 else { return }
+        stateLock.lock()
+        let t = transport
+        stateLock.unlock()
+        guard let t else { return }
+        var retransmitted = 0
+        for i in 0..<count {
+            let base = 2 + i * 4
+            let seq = UInt32(payload[base]) | UInt32(payload[base + 1]) << 8 | UInt32(payload[base + 2]) << 16 | UInt32(payload[base + 3]) << 24
+            stateLock.lock()
+            let cached = tileCache[seq]
+            stateLock.unlock()
+            if let cached = cached {
+                t.send(type: .region, frameId: seq, payload: cached)
+                retransmitted += 1
+            }
+        }
+        if retransmitted > 0 {
+            Log.v("TileNACK: retransmitted \(retransmitted)/\(count) tiles")
         }
     }
 
@@ -246,10 +309,18 @@ final class HostEngine {
             do {
                 let (w, h, did) = try await self.capture.switchDisplay(index)
                 self.currentDisplayID = did
-                if w != self.encoder.width || h != self.encoder.height {
-                    try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps, codec: self.codec)
+                if self.useRegionMode {
+                    self.regionEncoder.setup(width: w, height: h)
+                    stateLock.lock()
+                    self.pendingScreenSize = true
+                    stateLock.unlock()
+                    self.regionEncoder.forceFullFrame()
+                } else {
+                    if w != self.encoder.width || h != self.encoder.height {
+                        try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps, codec: self.codec)
+                    }
+                    self.encoder.forceKeyFrame()
                 }
-                self.encoder.forceKeyFrame()
                 self.sendDisplayInfo()
                 print("Switched to display \(self.capture.currentIndex)/\(self.capture.displayCount - 1)")
             } catch {
@@ -314,11 +385,77 @@ final class HostEngine {
             t.sendDatagram(d)
         }
     }
+
+    private var packetSeq: UInt32 = 0
+    private var tileCache: [UInt32: Data] = [:]
+    private var tileCacheOrder: [UInt32] = []
+    private let tileCacheLimit = 500
+
+    private func handleRegion(frameId: UInt32, x: UInt16, y: UInt16, w: UInt16, h: UInt16, jpeg: Data) {
+        stateLock.lock()
+        let t = transport
+        let elapsed = Date().timeIntervalSince(lastClientActivity)
+        let wasTimedOut = clientTimedOut
+        if elapsed > clientTimeout {
+            clientTimedOut = true
+        }
+        stateLock.unlock()
+
+        if elapsed > clientTimeout {
+            if !wasTimedOut {
+                print("Client inactive for \(Int(elapsed))s! — pausing video (timeout=\(Int(clientTimeout))s)")
+            }
+            return
+        }
+
+        guard let t else { return }
+
+        stateLock.lock()
+        let needSize = pendingScreenSize
+        pendingScreenSize = false
+        stateLock.unlock()
+        if needSize {
+            sendScreenSize()
+        }
+
+        stateLock.lock()
+        packetSeq &+= 1
+        let seq = packetSeq
+        stateLock.unlock()
+
+        var payload = Data()
+        payload.appendLE(x)
+        payload.appendLE(y)
+        payload.appendLE(w)
+        payload.appendLE(h)
+        payload.appendLE(UInt32(jpeg.count))
+        payload.append(jpeg)
+        t.send(type: .region, frameId: seq, payload: payload)
+        stateLock.lock()
+        tileCache[seq] = payload
+        tileCacheOrder.append(seq)
+        if tileCacheOrder.count > tileCacheLimit {
+            let evict = tileCacheOrder.removeFirst()
+            tileCache.removeValue(forKey: evict)
+        }
+        stateLock.unlock()
+    }
+
+    private func sendScreenSize() {
+        let w = capture.currentWidth
+        let h = capture.currentHeight
+        guard w > 0, h > 0 else { return }
+        var payload = Data()
+        payload.append(ControlSubType.screenSize.rawValue)
+        payload.appendLE(UInt16(w))
+        payload.appendLE(UInt16(h))
+        sendControl { $0.send(type: .control, payload: payload) }
+    }
 }
 
 func parseArgs() -> (port: UInt16, fps: Int, bitrateMbps: Int, displayIndex: Int, clientTimeout: TimeInterval, relay: HostEngine.RelaySpec?, codec: CodecType, debug: Bool) {
     var port: UInt16 = 42420
-    var fps = 60
+    var fps = 30
     var bitrate = 40
     var displayIndex = 0
     var clientTimeout: TimeInterval = 10

@@ -93,19 +93,23 @@ final class VideoView: NSView {
     override var acceptsFirstResponder: Bool { true }
 }
 
+extension VideoView: RemoteScreenView {
+    var nsView: NSView { self }
+}
+
 final class BorderlessWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 }
 
 final class InputSender {
     private let streamer: Streamer
-    private let view: VideoView
+    private let view: any RemoteScreenView
     private var monitors: [Any] = []
     private var captureDebugCount = 0
     var onCycleDisplay: (() -> Void)?
     var onUnlockRequest: (() -> Void)?
 
-    init(streamer: Streamer, view: VideoView) {
+    init(streamer: Streamer, view: any RemoteScreenView) {
         self.streamer = streamer
         self.view = view
     }
@@ -121,11 +125,11 @@ final class InputSender {
             guard let self else { return event }
 
             if event.type == .leftMouseDown, self.captureDebugCount == 0 {
-                let ourWin = self.view.window
+                let ourWin = self.view.nsView.window
                 print("monitor saw leftMouseDown: event.window=\(String(describing: event.window)) ourWindow=\(String(describing: ourWin)) match=\(ourWin === event.window) isKey=\(event.window?.isKeyWindow ?? false)")
             }
 
-            guard let window = event.window, window === self.view.window, window.isKeyWindow else {
+            guard let window = event.window, window === self.view.nsView.window, window.isKeyWindow else {
                 if self.captureDebugCount == 0, event.type == .leftMouseDown {
                     print("input monitor: event not for our key window — not sending")
                 }
