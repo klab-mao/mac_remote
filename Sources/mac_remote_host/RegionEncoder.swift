@@ -22,9 +22,12 @@ final class RegionEncoder {
     private var height: Int = 0
     private var forceFullFlag = true
     private var framesSinceRefresh = 0
-    private let refreshInterval = 120
+    private let refreshInterval = 60
     private var frameId: UInt32 = 0
     private let lock = NSLock()
+    private var cursorX: Int = -1
+    private var cursorY: Int = -1
+    private let maxTilesPerFrame = 150
 
     func setup(width: Int, height: Int) {
         lock.lock()
@@ -39,6 +42,13 @@ final class RegionEncoder {
     func forceFullFrame() {
         lock.lock()
         forceFullFlag = true
+        lock.unlock()
+    }
+
+    func updateCursor(x: Int, y: Int) {
+        lock.lock()
+        cursorX = x
+        cursorY = y
         lock.unlock()
     }
 
@@ -93,6 +103,7 @@ final class RegionEncoder {
             let tilesWide = (w + tileSize - 1) / tileSize
             let tilesHigh = (h + tileSize - 1) / tileSize
 
+            var dirtyTiles: [(tx: Int, ty: Int)] = []
             for ty in 0..<tilesHigh {
                 for tx in 0..<tilesWide {
                     let rx = tx * tileSize
@@ -101,12 +112,37 @@ final class RegionEncoder {
                     let rh = min(tileSize, h - ry)
 
                     if isTileDirty(curBase, curStride, prevBase, prevStride, rx, ry, rw, rh) {
-                        if let jpeg = encodeRegion(pixelBuffer, rx, ry, rw, rh, totalHeight: h) {
-                            onRegion?(fid, UInt16(rx), UInt16(ry), UInt16(rw), UInt16(rh), jpeg)
-                            regionCount += 1
-                            totalBytes += jpeg.count
-                        }
+                        dirtyTiles.append((tx, ty))
                     }
+                }
+            }
+
+            let cx = cursorX
+            let cy = cursorY
+            if cx >= 0 && cy >= 0 && dirtyTiles.count > maxTilesPerFrame {
+                dirtyTiles.sort { a, b in
+                    let ax = a.tx * tileSize + tileSize / 2
+                    let ay = a.ty * tileSize + tileSize / 2
+                    let bx = b.tx * tileSize + tileSize / 2
+                    let by = b.ty * tileSize + tileSize / 2
+                    let da = (ax - cx) * (ax - cx) + (ay - cy) * (ay - cy)
+                    let db = (bx - cx) * (bx - cx) + (by - cy) * (by - cy)
+                    return da < db
+                }
+            }
+
+            let limit = min(dirtyTiles.count, maxTilesPerFrame)
+            for i in 0..<limit {
+                let tx = dirtyTiles[i].tx
+                let ty = dirtyTiles[i].ty
+                let rx = tx * tileSize
+                let ry = ty * tileSize
+                let rw = min(tileSize, w - rx)
+                let rh = min(tileSize, h - ry)
+                if let jpeg = encodeRegion(pixelBuffer, rx, ry, rw, rh, totalHeight: h) {
+                    onRegion?(fid, UInt16(rx), UInt16(ry), UInt16(rw), UInt16(rh), jpeg)
+                    regionCount += 1
+                    totalBytes += jpeg.count
                 }
             }
 

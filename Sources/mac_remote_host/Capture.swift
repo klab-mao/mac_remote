@@ -68,7 +68,7 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         config.height = pixelH
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         config.queueDepth = 3
-        config.showsCursor = true
+        config.showsCursor = false
         config.capturesAudio = false
 
         let s = SCStream(filter: filter, configuration: config, delegate: self)

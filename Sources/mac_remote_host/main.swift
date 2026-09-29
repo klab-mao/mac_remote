@@ -301,6 +301,12 @@ final class HostEngine {
             screenW: bounds.width,
             screenH: bounds.height
         )
+
+        if p.kind == .mouseMove {
+            let localX = Int(CGFloat(p.nx) * bounds.width)
+            let localY = Int(CGFloat(p.ny) * bounds.height)
+            regionEncoder.updateCursor(x: localX, y: localY)
+        }
     }
 
     private func switchDisplay(to index: Int) {
@@ -389,7 +395,7 @@ final class HostEngine {
     private var packetSeq: UInt32 = 0
     private var tileCache: [UInt32: Data] = [:]
     private var tileCacheOrder: [UInt32] = []
-    private let tileCacheLimit = 500
+    private let tileCacheLimit = 1000
 
     private func handleRegion(frameId: UInt32, x: UInt16, y: UInt16, w: UInt16, h: UInt16, jpeg: Data) {
         stateLock.lock()

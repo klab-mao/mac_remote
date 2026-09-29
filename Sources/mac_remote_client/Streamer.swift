@@ -298,12 +298,12 @@ final class Streamer {
             maxTileSeq = seq
         }
         tilesSinceLastNackCheck += 1
-        if tilesSinceLastNackCheck >= 30 {
+        if tilesSinceLastNackCheck >= 10 {
             tilesSinceLastNackCheck = 0
             if maxTileSeq > 20 {
                 var missing: [UInt32] = []
                 let scanStart = maxTileSeq > 200 ? maxTileSeq - 200 : 1
-                let scanEnd = maxTileSeq - 10
+                let scanEnd = maxTileSeq - 5
                 var s = scanStart
                 while s < scanEnd && missing.count < 20 {
                     if !recentTileSeqs.contains(s) && !tileNackSent.contains(s) {

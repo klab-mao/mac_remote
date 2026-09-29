@@ -14,25 +14,31 @@ Host (controlled Mac)                         Client (viewing Mac)
 ---------------------                         --------------------
 ScreenCaptureKit (GPU capture, 60fps)
         |
-VideoToolbox H.264 hardware encoder
-(realtime, no B-frames, zero frame delay)
+RegionEncoder (128x128 tile diffing)
+  - per-tile JPEG encode (Metal CIContext)
+  - frame differencing vs previous frame
+  - periodic full refresh every 60 frames (~1s)
         |
-Fragmented UDP datagrams (1300B)  --------->  Frame reassembly
+Region packets (UDP, 1-2KB each)  --------->  Streamer (region reassembly)
+        |                                        |    ├─ gap detection → NACK (TCP)
+        |                                        |    └─ NACK retransmission
         |                                        |
-        |                                  AVSampleBufferDisplayLayer
-        |                                  (hardware decode + render)
+        |                                  RegionView (CATransaction batched)
+        |                                  (per-tile CALayer rendering)
         |                                        |
         +----- input events (UDP) <----------  NSEvent local monitor
-                                                  (mouse/keyboard/scroll)
+                                                   (mouse/keyboard/scroll)
 Host: CGEvent.post(tap: .cghidEventTap)       Client: borderless fullscreen window
 ```
 
 ### Key design choices
 
 - **ScreenCaptureKit** — GPU-accelerated capture at full retina resolution (macOS 12.3+). Zero-copy IOSurface pixel buffers passed directly to the encoder.
-- **VideoToolbox H.264/HEVC** — Apple media engine hardware encode/decode. Configured for minimal latency: `RealTime=true`, `AllowFrameReordering=false`, `MaxFrameDelayCount=0`. HEVC mode (`--codec hevc`) produces sharper text and screen content at the same bitrate.
-- **UDP transport** — no retransmission (real-time). Frames fragmented into 1300-byte datagrams. Keyframe requested on connect and on decode failure.
-- **SPS/PPS out-of-band** — parameter sets sent as control packets on keyframes; client builds `CMVideoFormatDescription` and feeds AVCC NALUs directly to `AVSampleBufferDisplayLayer`.
+- **Region-based JPEG tiles** — 128x128 tile grid with per-tile JPEG encoding (quality 0.35, ~1-2KB/tile). Only dirty tiles are sent. Metal-backed CIContext for GPU-accelerated JPEG encoding. Validated at FPS 261-320.
+- **UDP transport with NACK retransmission** — tiles sent as individual UDP datagrams (fast, no head-of-line blocking). Client detects sequence gaps and sends NACK over TCP (reliable); host re-sends missing tiles from a 1000-entry cache. Self-heal latency ~100ms.
+- **Periodic full refresh** — every 60 frames (~1s), all tiles re-sent individually as a safety-net fallback for any tiles NACK misses. Per-tile delivery 69-83% per refresh.
+- **CATransaction batched rendering** — all tiles from one frame batch are applied atomically via CATransaction to eliminate tearing during scroll/dynamic updates.
+- **Hybrid TCP/UDP transport** — control packets (ping/pong, hello, NACK, screenSize) over TCP (reliable); data packets (region tiles) over UDP (fast, with fragmentation). UDP hole punching for direct host-client connection when possible.
 - **Normalized input coordinates** — mouse position sent as 0.0-1.0 normalized within the captured display, mapped to global CG coordinates on the host. Retina scaling and multi-monitor offsets handled transparently.
 - **Separate input channel** — input events share the UDP connection but use distinct packet types, keeping them low-latency and independent of video frame timing.
 
@@ -45,19 +51,21 @@ mac_remote/
     MacRemoteCore/                 Shared library
       Protocol.swift               Packet header, types, InputPacket, Packetizer, Transport
       Transport.swift              UDPFlow (NWConnection), UDPListener (NWListener)
-      RelayClient.swift            RelayTransport: TCP auth (HMAC challenge) + UDP relay data plane
+      RelayClient.swift            RelayTransport: hybrid TCP control + UDP data, hole punching, frag reassembly
     mac_remote_host/               Host executable (the controlled Mac)
-      main.swift                   HostEngine: lifecycle, flow handling, arg parsing
+      main.swift                   HostEngine: lifecycle, region handling, NACK handler, tile cache
       Capture.swift                CaptureEngine: SCStream multi-display + switching
-      Encoder.swift                H264Encoder: VTCompressionSession wrapper
+      RegionEncoder.swift          128x128 tile diffing, Metal JPEG encode, periodic full refresh
+      Encoder.swift                H264Encoder: VTCompressionSession wrapper (legacy mode)
       InputInjector.swift          CGEvent mouse/keyboard/scroll injection
     mac_remote_client/             Client executable (the viewing Mac)
       main.swift                   ClientDelegate: window, streamer, timers
-      Streamer.swift               Frame reassembly, sample buffer creation, decode
+      Streamer.swift               Region reassembly, NACK gap detection, tile seq tracking
+      RegionView.swift             CATransaction-batched per-tile CALayer rendering
       InputSender.swift            VideoView, BorderlessWindow, NSEvent monitor
   relayd/                          Cloud relay server (Go) — bridges two intranets
     main.go                        Flags, accounts loading, startup
-    control.go                     TCP control: HMAC challenge-response, sessions
+    control.go                     TCP control: HMAC challenge-response, sessions, frData forwarding
     udp.go                         UDP data plane: session bind + bidirectional forwarding
     control_test.go                Integration tests: auth, sessions, forwarding
   docs/RELAY.md                    Relay deployment guide + protocol reference

@@ -167,7 +167,7 @@ final class InputSender {
         if let monitor {
             monitors.append(monitor)
         }
-        NSCursor.hide()
+        NSCursor.arrow.set()
     }
 
     private func packet(from event: NSEvent) -> InputPacket? {
