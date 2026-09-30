@@ -63,10 +63,10 @@ final class HostEngine {
             self?.sendFrameComplete(frameId: fid, tileCount: count)
         }
 
-        capture.onFrame = { [weak self] pixelBuffer, time in
+        capture.onFrame = { [weak self] pixelBuffer, time, dirtyRects, scaleFactor in
             guard let self else { return }
             if self.useRegionMode {
-                self.regionEncoder.encode(pixelBuffer)
+                self.regionEncoder.encode(pixelBuffer, dirtyRects: dirtyRects, scaleFactor: scaleFactor)
             } else {
                 self.encoder.encode(pixelBuffer, time: time)
             }
@@ -105,6 +105,7 @@ final class HostEngine {
                         try self.encoder.setup(width: w, height: h, fps: self.fps, bitrateMbps: self.bitrateMbps, codec: self.codec)
                     }
                     try await self.capture.beginStream()
+                    self.startCursorTracking()
                     break
                 } catch {
                     print("Startup failed: \(error) — retrying in 5s")
@@ -288,6 +289,9 @@ final class HostEngine {
 
     private func handleInput(payload: Data) {
         guard let p = InputPacket.decode(payload) else { return }
+        if p.kind == .mouseDown && p.clickCount > 1 {
+            print("host mouseDown: clickCount=\(p.clickCount) pos=(\(String(format: "%.4f", p.nx)),\(String(format: "%.4f", p.ny)))")
+        }
         let bounds = CGDisplayBounds(currentDisplayID)
         let gx = bounds.minX + CGFloat(p.nx) * bounds.width
         let gy = bounds.minY + CGFloat(p.ny) * bounds.height
@@ -400,6 +404,11 @@ final class HostEngine {
     private var tileCache: [UInt32: Data] = [:]
     private var tileCacheOrder: [UInt32] = []
     private let tileCacheLimit = 1000
+    private let budgetRate: Double = 2_000_000
+    private let budgetMax: Double = 4_000_000
+    private var budgetTokens: Double = 2_000_000
+    private var budgetLastRefill = Date()
+    private var budgetDrops = 0
 
     private func handleRegion(frameId: UInt32, x: UInt16, y: UInt16, w: UInt16, h: UInt16, jpeg: Data) {
         stateLock.lock()
@@ -427,6 +436,24 @@ final class HostEngine {
         if needSize {
             sendScreenSize()
         }
+
+        stateLock.lock()
+        let now = Date()
+        let dt = now.timeIntervalSince(budgetLastRefill)
+        if dt > 0 {
+            budgetLastRefill = now
+            budgetTokens = min(budgetMax, budgetTokens + dt * budgetRate)
+        }
+        if Double(jpeg.count) > budgetTokens {
+            budgetDrops += 1
+            if budgetDrops % 200 == 1 {
+                print("bandwidth budget: dropped \(budgetDrops) tiles (tokens=\(Int(budgetTokens)))")
+            }
+            stateLock.unlock()
+            return
+        }
+        budgetTokens -= Double(jpeg.count)
+        stateLock.unlock()
 
         stateLock.lock()
         packetSeq &+= 1
@@ -468,6 +495,64 @@ final class HostEngine {
         payload.append(ControlSubType.frameComplete.rawValue)
         payload.appendLE(frameId)
         payload.appendLE(UInt16(tileCount))
+        sendControl { $0.send(type: .control, payload: payload) }
+    }
+
+    private var lastCursorData: Data?
+    private var cursorTimer: DispatchSourceTimer?
+    private let caretTracker = CaretTracker()
+
+    func startCursorTracking() {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(20), repeating: .milliseconds(20))
+        timer.setEventHandler { [weak self] in
+            self?.checkCursorShape()
+        }
+        timer.resume()
+        cursorTimer = timer
+
+        caretTracker.onCaretUpdate = { [weak self] visible, rect in
+            self?.sendCaretPosition(visible: visible, rect: rect)
+        }
+        caretTracker.start()
+    }
+
+    private func sendCaretPosition(visible: Bool, rect: CGRect) {
+        let bounds = CGDisplayBounds(currentDisplayID)
+        let nx = Float((rect.origin.x - bounds.minX) / bounds.width)
+        let ny = Float((rect.origin.y - bounds.minY) / bounds.height)
+        let h = UInt16(min(rect.height, 100))
+        var payload = Data()
+        payload.append(ControlSubType.caretPosition.rawValue)
+        payload.append(visible ? UInt8(1) : UInt8(0))
+        payload.appendLE(UInt16(nx * 65535))
+        payload.appendLE(UInt16(ny * 65535))
+        payload.appendLE(h)
+        sendControl { $0.send(type: .control, payload: payload) }
+    }
+
+    private func checkCursorShape() {
+        guard let current = NSCursor.currentSystem else { return }
+        let image = current.image
+        let logicalSize = image.size
+        var rect = CGRect(origin: .zero, size: logicalSize)
+        guard let cgImage = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return }
+        let pngMutable = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(pngMutable, "public.png" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dest, cgImage, nil)
+        guard CGImageDestinationFinalize(dest) else { return }
+        let png = pngMutable as Data
+        if png.count > 20000 { return }
+        if png == lastCursorData { return }
+        lastCursorData = png
+        print("[cursor] size=\(logicalSize) pixels=\(cgImage.width)x\(cgImage.height) hot=\(current.hotSpot) png=\(png.count)B")
+        var payload = Data()
+        payload.append(ControlSubType.cursorShape.rawValue)
+        payload.appendLE(Float(current.hotSpot.x))
+        payload.appendLE(Float(current.hotSpot.y))
+        payload.appendLE(Float(logicalSize.width))
+        payload.appendLE(Float(logicalSize.height))
+        payload.append(png)
         sendControl { $0.send(type: .control, payload: payload) }
     }
 }

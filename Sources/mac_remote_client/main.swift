@@ -21,6 +21,7 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
     private var lastFrameTime = Date()
     private var lastRemoteSize: CGSize = .zero
     private var isReconnecting = false
+    private var forceReconnecting = false
     private let useRegionMode: Bool
 
     init(transport: Transport, modeLabel: String, useRegionMode: Bool) {
@@ -66,6 +67,7 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
                 self.lastFrameTime = Date()
                 if self.isReconnecting {
                     self.isReconnecting = false
+                    self.forceReconnecting = false
                     print("Reconnected — video resumed")
                 }
                 view?.updateRegionBatch(regions: regions)
@@ -74,6 +76,17 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
                 streamer.onFrameComplete = { [weak rv] fid, count in
                     rv?.frameComplete(frameId: fid, expectedTiles: count)
                 }
+            }
+            streamer.onCursorImage = { imageData, hotX, hotY, w, h in
+                DispatchQueue.main.async {
+                    guard let image = NSImage(data: imageData) else { return }
+                    image.size = NSSize(width: CGFloat(w), height: CGFloat(h))
+                    let cursor = NSCursor(image: image, hotSpot: NSPoint(x: CGFloat(hotX), y: CGFloat(hotY)))
+                    cursor.set()
+                }
+            }
+            streamer.onCaretPosition = { [weak self] visible, nx, ny, h in
+                self?.regionView?.updateCaret(visible: visible, nx: nx, ny: ny, height: h)
             }
         } else {
             let view = VideoView(frame: NSRect(origin: .zero, size: screenFrame.size))
@@ -187,6 +200,16 @@ final class ClientDelegate: NSObject, NSApplicationDelegate {
                     print("No video for \(Int(elapsed))s — requesting keyframe...")
                 }
                 self.streamer?.sendHelloAndKeyframe()
+            }
+            if elapsed > 15 && !self.forceReconnecting {
+                self.forceReconnecting = true
+                print("No video for \(Int(elapsed))s — forcing full reconnect")
+                if let rt = self.transport as? RelayTransport {
+                    rt.reconnect()
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+                    self?.forceReconnecting = false
+                }
             }
         }
     }

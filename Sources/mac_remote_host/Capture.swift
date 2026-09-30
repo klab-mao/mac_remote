@@ -5,7 +5,7 @@ import CoreVideo
 import CoreGraphics
 
 final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
-    var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
+    var onFrame: ((CVPixelBuffer, CMTime, [CGRect]?, CGFloat) -> Void)?
 
     private var stream: SCStream?
     private let frameQueue = DispatchQueue(label: "mac_remote.capture")
@@ -84,6 +84,19 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        print("SCStream stopped with error: \(error) — restarting in 3s")
+        Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            do {
+                try await self.startStream()
+                print("SCStream restarted successfully")
+            } catch {
+                print("SCStream restart failed: \(error)")
+            }
+        }
+    }
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, sampleBuffer.isValid else { return }
         if let statusNumber = CMGetAttachment(
@@ -96,7 +109,21 @@ final class CaptureEngine: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        onFrame?(pixelBuffer, time)
+        var dirtyRects: [CGRect]?
+        if let arr = CMGetAttachment(
+            sampleBuffer,
+            key: SCStreamFrameInfo.dirtyRects.rawValue as CFString,
+            attachmentModeOut: nil
+        ) as? [NSValue] {
+            let parsed = arr.compactMap { $0.rectValue }
+            if !parsed.isEmpty { dirtyRects = parsed }
+        }
+        let scale = (CMGetAttachment(
+            sampleBuffer,
+            key: SCStreamFrameInfo.scaleFactor.rawValue as CFString,
+            attachmentModeOut: nil
+        ) as? NSNumber)?.doubleValue ?? 0
+        onFrame?(pixelBuffer, time, dirtyRects, scale)
     }
 
     enum CaptureError: Error {

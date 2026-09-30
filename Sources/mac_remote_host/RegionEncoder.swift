@@ -10,7 +10,9 @@ final class RegionEncoder {
     var onFrameComplete: ((UInt32, Int) -> Void)?
 
     private let tileSize = 128
-    private let jpegQuality: CGFloat = 0.5
+    private var currentQuality: CGFloat = 0.5
+    private var qualityEMA: Double = -1
+    private var webpSupported: Bool?
     private let ciContext: CIContext = {
         if let device = MTLCreateSystemDefaultDevice() {
             return CIContext(mtlDevice: device)
@@ -53,7 +55,7 @@ final class RegionEncoder {
         lock.unlock()
     }
 
-    func encode(_ pixelBuffer: CVPixelBuffer) {
+    func encode(_ pixelBuffer: CVPixelBuffer, dirtyRects: [CGRect]?, scaleFactor: CGFloat) {
         lock.lock()
         let w = width
         let h = height
@@ -104,9 +106,35 @@ final class RegionEncoder {
             let tilesWide = (w + tileSize - 1) / tileSize
             let tilesHigh = (h + tileSize - 1) / tileSize
 
+            var candidates: Set<Int>?
+            if let rects = dirtyRects, !rects.isEmpty, scaleFactor > 0, fid % 30 != 0 {
+                var keys = Set<Int>()
+                let hh = CGFloat(h)
+                for r0 in rects.prefix(16) {
+                    let rp = CGRect(x: r0.minX * scaleFactor, y: r0.minY * scaleFactor,
+                                    width: r0.width * scaleFactor, height: r0.height * scaleFactor)
+                    let flipped = CGRect(x: rp.minX, y: hh - rp.maxY, width: rp.width, height: rp.height)
+                    for rr in [rp, flipped] {
+                        let inf = rr.insetBy(dx: -16, dy: -16)
+                        let tx0 = max(0, Int(inf.minX) / tileSize)
+                        let tx1 = min(tilesWide - 1, Int(inf.maxX) / tileSize)
+                        let ty0 = max(0, Int(inf.minY) / tileSize)
+                        let ty1 = min(tilesHigh - 1, Int(inf.maxY) / tileSize)
+                        guard tx0 <= tx1, ty0 <= ty1 else { continue }
+                        for ty in ty0...ty1 {
+                            for tx in tx0...tx1 {
+                                keys.insert((ty << 16) | tx)
+                            }
+                        }
+                    }
+                }
+                if !keys.isEmpty { candidates = keys }
+            }
+
             var dirtyTiles: [(tx: Int, ty: Int)] = []
             for ty in 0..<tilesHigh {
                 for tx in 0..<tilesWide {
+                    if let candidates, !candidates.contains((ty << 16) | tx) { continue }
                     let rx = tx * tileSize
                     let ry = ty * tileSize
                     let rw = min(tileSize, w - rx)
@@ -118,9 +146,21 @@ final class RegionEncoder {
                 }
             }
 
+            let normalized = Double(dirtyTiles.count) / Double(max(tilesWide * tilesHigh, 1))
+            qualityEMA = qualityEMA < 0 ? normalized : qualityEMA * 0.85 + normalized * 0.15
+            let act = min(max(qualityEMA, 0), 1)
+            currentQuality = CGFloat(0.7 - act * 0.5)
+
+            if normalized > 0.7 {
+                lock.lock()
+                forceFullFlag = true
+                lock.unlock()
+            }
+
             let cx = cursorX
             let cy = cursorY
-            if cx >= 0 && cy >= 0 && dirtyTiles.count > maxTilesPerFrame {
+            let largeChange = normalized > 0.5
+            if cx >= 0 && cy >= 0 && dirtyTiles.count > maxTilesPerFrame && !largeChange {
                 dirtyTiles.sort { a, b in
                     let ax = a.tx * tileSize + tileSize / 2
                     let ay = a.ty * tileSize + tileSize / 2
@@ -132,7 +172,7 @@ final class RegionEncoder {
                 }
             }
 
-            let limit = min(dirtyTiles.count, maxTilesPerFrame)
+            let limit = largeChange ? dirtyTiles.count : min(dirtyTiles.count, maxTilesPerFrame)
             for i in 0..<limit {
                 let tx = dirtyTiles[i].tx
                 let ty = dirtyTiles[i].ty
@@ -180,9 +220,24 @@ final class RegionEncoder {
         let ciY = totalHeight - y - h
         let rect = CGRect(x: x, y: ciY, width: w, height: h)
         guard let cgImage = ciContext.createCGImage(ciImage, from: rect) else { return nil }
+        let quality = currentQuality
+        if webpSupported != false {
+            let webpData = NSMutableData()
+            if let dest = CGImageDestinationCreateWithData(webpData, "public.webp" as CFString, 1, nil) {
+                CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+                if CGImageDestinationFinalize(dest) {
+                    webpSupported = true
+                    return webpData as Data
+                }
+            }
+            if webpSupported == nil {
+                webpSupported = false
+                print("[RegionEncoder] WebP encode unavailable — falling back to JPEG")
+            }
+        }
         let mutableData = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(mutableData, "public.jpeg" as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: jpegQuality] as CFDictionary)
+        CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return mutableData as Data
     }

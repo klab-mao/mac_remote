@@ -3,6 +3,8 @@ import CoreGraphics
 import MacRemoteCore
 
 enum InputInjector {
+    private static let eventSource = CGEventSource(stateID: .combinedSessionState)
+
     static func perform(_ p: InputPacket, originX: CGFloat, originY: CGFloat, screenW: CGFloat, screenH: CGFloat) {
         let x = originX + CGFloat(p.nx) * screenW
         let y = originY + CGFloat(p.ny) * screenH
@@ -20,14 +22,14 @@ enum InputInjector {
             default:
                 type = moveType(p.button)
             }
-            guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: button) else { return }
+            guard let event = CGEvent(mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: button) else { return }
             event.flags = cgFlags
             event.setIntegerValueField(.mouseEventClickState, value: Int64(p.clickCount))
             event.post(tap: .cghidEventTap)
 
         case .scroll:
             guard let event = CGEvent(
-                scrollWheelEvent2Source: nil,
+                scrollWheelEvent2Source: eventSource,
                 units: .pixel,
                 wheelCount: 2,
                 wheel1: Int32(p.dy),
@@ -37,7 +39,7 @@ enum InputInjector {
             event.post(tap: .cghidEventTap)
 
         case .keyDown, .keyUp, .flagsChanged:
-            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: p.keyCode, keyDown: p.kind == .keyDown) else { return }
+            guard let event = CGEvent(keyboardEventSource: eventSource, virtualKey: p.keyCode, keyDown: p.kind == .keyDown) else { return }
             event.type = p.kind == .keyDown ? .keyDown : (p.kind == .keyUp ? .keyUp : .flagsChanged)
             event.flags = cgFlags
             event.post(tap: .cghidEventTap)

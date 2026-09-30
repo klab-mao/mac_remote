@@ -14,6 +14,8 @@ final class Streamer {
     var onUnlockResult: ((UnlockResultCode) -> Void)?
     var onLockState: ((Bool) -> Void)?
     var onFrameComplete: ((UInt32, Int) -> Void)?
+    var onCursorImage: ((Data, Float, Float, Float, Float) -> Void)?
+    var onCaretPosition: ((Bool, Float, Float, UInt16) -> Void)?
 
     private let transport: Transport
     private let assembler = FrameAssembler()
@@ -158,6 +160,21 @@ final class Streamer {
             let fid = UInt32(payload[1]) | UInt32(payload[2]) << 8 | UInt32(payload[3]) << 16 | UInt32(payload[4]) << 24
             let tileCount = Int(payload[5]) | Int(payload[6]) << 8
             onFrameComplete?(fid, tileCount)
+        case .cursorShape:
+            guard payload.count >= 17 else { return }
+            let hotX = Float(bitPattern: UInt32(payload[1]) | UInt32(payload[2]) << 8 | UInt32(payload[3]) << 16 | UInt32(payload[4]) << 24)
+            let hotY = Float(bitPattern: UInt32(payload[5]) | UInt32(payload[6]) << 8 | UInt32(payload[7]) << 16 | UInt32(payload[8]) << 24)
+            let w = Float(bitPattern: UInt32(payload[9]) | UInt32(payload[10]) << 8 | UInt32(payload[11]) << 16 | UInt32(payload[12]) << 24)
+            let h = Float(bitPattern: UInt32(payload[13]) | UInt32(payload[14]) << 8 | UInt32(payload[15]) << 16 | UInt32(payload[16]) << 24)
+            let imageData = payload.subdata(in: 17..<payload.count)
+            onCursorImage?(imageData, hotX, hotY, w, h)
+        case .caretPosition:
+            guard payload.count >= 8 else { return }
+            let visible = payload[1] != 0
+            let nx = Float(UInt16(payload[2]) | UInt16(payload[3]) << 8) / 65535.0
+            let ny = Float(UInt16(payload[4]) | UInt16(payload[5]) << 8) / 65535.0
+            let h = UInt16(payload[6]) | UInt16(payload[7]) << 8
+            onCaretPosition?(visible, nx, ny, h)
         default:
             break
         }

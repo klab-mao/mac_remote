@@ -136,6 +136,10 @@ final class InputSender {
                 return event
             }
 
+            if event.type == .leftMouseDown && event.clickCount > 1 {
+                print("click: clickCount=\(event.clickCount)")
+            }
+
             if event.type == .keyDown, event.keyCode == 53 {
                 onQuit()
                 return nil
@@ -193,7 +197,7 @@ final class InputSender {
         case .leftMouseUp, .rightMouseUp, .otherMouseUp:
             guard let n = view.normalizedPoint(for: event) else { return nil }
             let button: UInt8 = event.type == .leftMouseUp ? 0 : (event.type == .rightMouseUp ? 1 : 2)
-            return InputPacket(kind: .mouseUp, button: button, flags: flags, nx: n.nx, ny: n.ny)
+            return InputPacket(kind: .mouseUp, button: button, flags: flags, nx: n.nx, ny: n.ny, clickCount: UInt32(clamping: event.clickCount))
 
         case .scrollWheel:
             return InputPacket(kind: .scroll, flags: flags, dx: Float(event.scrollingDeltaX), dy: Float(event.scrollingDeltaY))

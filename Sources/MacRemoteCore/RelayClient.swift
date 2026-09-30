@@ -260,7 +260,7 @@ public final class RelayTransport: Transport {
         startPingTimer()
     }
 
-    private func reconnect() {
+    public func reconnect() {
         guard !reconnecting else { return }
         reconnecting = true
         phase = .disconnected
@@ -510,6 +510,10 @@ public final class RelayTransport: Transport {
         guard phase == .established else { return }
         
         if let header = PacketHeader.decode(data), header.type == .control {
+            if data.count > PacketHeader.size && data[PacketHeader.size] == ControlSubType.ping.rawValue {
+                dataSocket?.sendTo(data, host: relayHost, port: relayUdpPort)
+                return
+            }
             sendCtrl(.data, data)
             return
         }

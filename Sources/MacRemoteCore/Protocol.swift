@@ -24,6 +24,28 @@ public enum ControlSubType: UInt8 {
     case screenSize = 13
     case tileNack = 14
     case frameComplete = 15
+    case cursorShape = 16
+    case caretPosition = 17
+}
+
+public enum CursorType: UInt8 {
+    case arrow = 0
+    case iBeam = 1
+    case crosshair = 2
+    case openHand = 3
+    case closedHand = 4
+    case pointingHand = 5
+    case resizeLeft = 6
+    case resizeRight = 7
+    case resizeLeftRight = 8
+    case resizeUp = 9
+    case resizeDown = 10
+    case resizeUpDown = 11
+    case disappearingItem = 12
+    case operation = 13
+    case contextualMenu = 14
+    case resizeDiagonal = 15
+    case custom = 255
 }
 
 public enum CodecType: UInt8 {

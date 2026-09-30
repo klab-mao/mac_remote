@@ -17,11 +17,15 @@ final class RegionView: NSView {
     private let infoLabel = NSTextField(labelWithString: "")
     private var infoHideTimer: Timer?
     private var tileLayers: [Int: CALayer] = [:]
+    private var tileLatestFrame: [Int: UInt32] = [:]
     private let fullLayer = CALayer()
     private var frameBuffers: [UInt32: [(x: Int, y: Int, cgImage: CGImage)]] = [:]
     private var expectedTileCounts: [UInt32: Int] = [:]
     private var flushTimer: Timer?
     private var latestRenderedFrameId: UInt32 = 0
+    private let caretLayer = CALayer()
+    private var caretBlinkTimer: Timer?
+    private var caretVisible = false
 
     var remoteSize: CGSize = .zero {
         didSet {
@@ -52,8 +56,41 @@ final class RegionView: NSView {
         infoLabel.isHidden = true
         addSubview(infoLabel)
 
+        caretLayer.backgroundColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        caretLayer.isHidden = true
+        screenLayer.addSublayer(caretLayer)
+
         flushTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             self?.flushPendingTiles()
+        }
+    }
+
+    func updateCaret(visible: Bool, nx: Float, ny: Float, height: UInt16) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.caretVisible = visible
+            if visible {
+                let x = CGFloat(nx) * self.remoteSize.width
+                let flippedY = self.remoteSize.height - CGFloat(ny) * self.remoteSize.height - CGFloat(height)
+                self.caretLayer.frame = CGRect(x: x, y: flippedY, width: 2, height: CGFloat(height))
+                self.caretLayer.isHidden = false
+                if self.caretBlinkTimer == nil {
+                    self.startCaretBlink()
+                }
+            } else {
+                self.caretLayer.isHidden = true
+                self.caretBlinkTimer?.invalidate()
+                self.caretBlinkTimer = nil
+            }
+        }
+    }
+
+    private func startCaretBlink() {
+        caretBlinkTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if self.caretVisible {
+                self.caretLayer.isHidden.toggle()
+            }
         }
     }
 
@@ -72,6 +109,7 @@ final class RegionView: NSView {
             tl.removeFromSuperlayer()
         }
         tileLayers.removeAll()
+        tileLatestFrame.removeAll()
         needsLayout = true
     }
 
@@ -92,8 +130,13 @@ final class RegionView: NSView {
                 guard let self else { return }
                 var immediateTiles: [(x: Int, y: Int, cgImage: CGImage)] = []
                 for (x, y, fid, cgImage) in decoded {
+                    let key = self.tileKey(x: x, y: y)
+                    if let existing = self.tileLatestFrame[key], existing > fid {
+                        continue
+                    }
                     if fid <= self.latestRenderedFrameId {
                         immediateTiles.append((x, y, cgImage))
+                        self.tileLatestFrame[key] = fid
                     } else {
                         self.frameBuffers[fid, default: []].append((x, y, cgImage))
                     }
@@ -114,7 +157,18 @@ final class RegionView: NSView {
     private func renderFrame(_ frameId: UInt32) {
         guard let tiles = frameBuffers.removeValue(forKey: frameId), !tiles.isEmpty else { return }
         expectedTileCounts.removeValue(forKey: frameId)
-        renderTiles(tiles)
+        var freshTiles: [(x: Int, y: Int, cgImage: CGImage)] = []
+        for (x, y, cgImage) in tiles {
+            let key = tileKey(x: x, y: y)
+            if let existing = tileLatestFrame[key], existing > frameId {
+                continue
+            }
+            freshTiles.append((x, y, cgImage))
+            tileLatestFrame[key] = frameId
+        }
+        if !freshTiles.isEmpty {
+            renderTiles(freshTiles)
+        }
         latestRenderedFrameId = max(latestRenderedFrameId, frameId)
     }
 
