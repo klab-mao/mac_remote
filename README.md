@@ -17,7 +17,11 @@ ScreenCaptureKit (GPU capture, 60fps)
 RegionEncoder (128x128 tile diffing)
   - per-tile JPEG encode (Metal CIContext)
   - frame differencing vs previous frame
+  - adaptive quality (0.2 scroll / 0.7 static)
+  - dirty-rect scan hint (SCStreamFrameInfo)
+  - 2MB/s token-bucket bandwidth budget
   - periodic full refresh every 60 frames (~1s)
+  - full refresh on >70% dirty tiles (window resize/move)
         |
 Region packets (UDP, 1-2KB each)  --------->  Streamer (region reassembly)
         |                                        |    ├─ gap detection → NACK (TCP)
@@ -25,9 +29,17 @@ Region packets (UDP, 1-2KB each)  --------->  Streamer (region reassembly)
         |                                        |
         |                                  RegionView (CATransaction batched)
         |                                  (per-tile CALayer rendering)
-        |                                        |
+        |                                  (stale tile filtering by frameId)
+        |                                  (blinking caret overlay)
+        |
+        +-- cursor image (TCP, 20ms) ----->  NSCursor(image, hotSpot).set()
+        |   (PNG + hot spot + logical size)    (shows exact host cursor)
+        |
+        +-- caret position (TCP, 200ms) --->  CALayer blinking caret overlay
+        |   (AX API: visible + rect)          (500ms blink interval)
+        |
         +----- input events (UDP) <----------  NSEvent local monitor
-                                                   (mouse/keyboard/scroll)
+                                                    (mouse/keyboard/scroll)
 Host: CGEvent.post(tap: .cghidEventTap)       Client: borderless fullscreen window
 ```
 
@@ -37,8 +49,14 @@ Host: CGEvent.post(tap: .cghidEventTap)       Client: borderless fullscreen wind
 - **Region-based JPEG tiles** — 128x128 tile grid with per-tile JPEG encoding (quality 0.35, ~1-2KB/tile). Only dirty tiles are sent. Metal-backed CIContext for GPU-accelerated JPEG encoding. Validated at FPS 261-320.
 - **UDP transport with NACK retransmission** — tiles sent as individual UDP datagrams (fast, no head-of-line blocking). Client detects sequence gaps and sends NACK over TCP (reliable); host re-sends missing tiles from a 1000-entry cache. Self-heal latency ~100ms.
 - **Periodic full refresh** — every 60 frames (~1s), all tiles re-sent individually as a safety-net fallback for any tiles NACK misses. Per-tile delivery 69-83% per refresh.
-- **CATransaction batched rendering** — all tiles from one frame batch are applied atomically via CATransaction to eliminate tearing during scroll/dynamic updates.
-- **Hybrid TCP/UDP transport** — control packets (ping/pong, hello, NACK, screenSize) over TCP (reliable); data packets (region tiles) over UDP (fast, with fragmentation). UDP hole punching for direct host-client connection when possible.
+- **CATransaction batched rendering** — all tiles from one frame batch are applied atomically via CATransaction to eliminate tearing during scroll/dynamic updates. Stale tiles (older frameId for same position) are discarded to reduce flicker.
+- **Cursor image channel** — host polls `NSCursor.currentSystem` every 20ms, encodes the cursor image as PNG, and sends it via TCP control channel with hot spot + logical size. Client creates `NSCursor(image:hotSpot:)` and calls `cursor.set()`. Client shows exactly the host's cursor — including resize cursors, diagonal cursors, and custom system cursors. No cursor type matching or heuristic detection needed.
+- **Caret blinking via AX API** — host uses `AXUIElementCreateSystemWide()` to detect the focused text field and caret position every 200ms. Client renders a blinking caret overlay (500ms interval) as a CALayer. Works around the macOS limitation where `showsCursor=false` hides both mouse cursor and text caret.
+- **Adaptive JPEG quality** — EMA of dirty tile ratio drives quality: 0.7 when static (sharp), 0.2 during scrolling (more tiles/sec). Keeps traffic under 2MB/s budget without forced drops.
+- **Dirty-rect scan hint** — `SCStreamFrameInfo.dirtyRects` (macOS 12.3+) limits tile scanning to tiles intersecting changed areas. Full scan every 30 frames as safety net.
+- **2MB/s bandwidth budget** — token bucket (4MB burst) drops tiles over budget before sequence assignment, so clients never see gaps. Adaptive quality alone keeps traffic under budget during scroll.
+- **Full refresh on large changes** — when >50% of tiles are dirty, the 300-tile-per-frame cap is removed. When >70% are dirty, the next frame is forced to a full refresh. Makes window resize/move/minimize-restore instant.
+- **Hybrid TCP/UDP transport** — control packets (ping/pong, hello, NACK, screenSize, cursorShape, caretPosition) over TCP (reliable); data packets (region tiles) over UDP (fast, with fragmentation). Pings also routed over UDP to keep NAT alive. UDP hole punching for direct host-client connection when possible.
 - **Normalized input coordinates** — mouse position sent as 0.0-1.0 normalized within the captured display, mapped to global CG coordinates on the host. Retina scaling and multi-monitor offsets handled transparently.
 - **Separate input channel** — input events share the UDP connection but use distinct packet types, keeping them low-latency and independent of video frame timing.
 
@@ -53,15 +71,17 @@ mac_remote/
       Transport.swift              UDPFlow (NWConnection), UDPListener (NWListener)
       RelayClient.swift            RelayTransport: hybrid TCP control + UDP data, hole punching, frag reassembly
     mac_remote_host/               Host executable (the controlled Mac)
-      main.swift                   HostEngine: lifecycle, region handling, NACK handler, tile cache
-      Capture.swift                CaptureEngine: SCStream multi-display + switching
-      RegionEncoder.swift          128x128 tile diffing, Metal JPEG encode, periodic full refresh
+      main.swift                   HostEngine: lifecycle, region handling, NACK handler, tile cache, cursor/caret tracking
+      Capture.swift                CaptureEngine: SCStream multi-display + switching, dirtyRects extraction
+      RegionEncoder.swift          128x128 tile diffing, Metal JPEG encode, adaptive quality, dirty-rect hint, bandwidth budget, full refresh
       Encoder.swift                H264Encoder: VTCompressionSession wrapper (legacy mode)
-      InputInjector.swift          CGEvent mouse/keyboard/scroll injection
+      InputInjector.swift          CGEvent mouse/keyboard/scroll injection (shared CGEventSource for click state)
+      CursorDetector.swift         Legacy cursor type detection (unused — image-based approach supersedes)
+      CaretTracker.swift           AX API caret position polling (system-wide focused element + selected text range)
     mac_remote_client/             Client executable (the viewing Mac)
-      main.swift                   ClientDelegate: window, streamer, timers
-      Streamer.swift               Region reassembly, NACK gap detection, tile seq tracking
-      RegionView.swift             CATransaction-batched per-tile CALayer rendering
+      main.swift                   ClientDelegate: window, streamer, timers, cursor image rendering, caret overlay
+      Streamer.swift               Region reassembly, NACK gap detection, tile seq tracking, cursor/caret callbacks
+      RegionView.swift             CATransaction-batched per-tile CALayer rendering, stale tile filtering, blinking caret overlay
       InputSender.swift            VideoView, BorderlessWindow, NSEvent monitor
   relayd/                          Cloud relay server (Go) — bridges two intranets
     main.go                        Flags, accounts loading, startup
@@ -229,7 +249,7 @@ To unlock a locked remote Mac, press **Cmd+Shift+U** on the client, enter the ho
 
 ```
 [1] version    (always 1)
-[1] type       (0=video, 1=input, 2=control)
+[1] type       (0=video, 1=input, 2=control, 3=region)
 [1] flags      (video: bit 0 = keyframe)
 [1] reserved
 [4] frameId
@@ -251,6 +271,15 @@ To unlock a locked remote Mac, press **Cmd+Shift+U** on the client, enter the ho
 | 6     | unlockRequest   | client→host | password (UTF-8)                                                                      |
 | 7     | unlockResult    | host→client | result code (0=unlocked, 1=notLocked, 2=stillLocked, 3=unsupportedCharacter, 4=error) |
 | 8     | lockState       | host→client | 1 = locked, 0 = unlocked                                                              |
+| 9     | ping            | both        | heartbeat (routed over UDP to keep NAT alive)                                         |
+| 10    | pong            | both        | heartbeat reply                                                                       |
+| 11    | setBitrate      | client→host | new bitrate in Mbps                                                                   |
+| 12    | nack            | client→host | missing fragment sequence numbers                                                     |
+| 13    | screenSize      | host→client | width (UInt16) + height (UInt16)                                                      |
+| 14    | tileNack        | client→host | missing tile sequence numbers (TCP reliable)                                          |
+| 15    | frameComplete   | host→client | frameId (UInt32) + tileCount (UInt16) — triggers atomic frame render                   |
+| 16    | cursorShape     | host→client | hotX(f32) + hotY(f32) + width(f32) + height(f32) + PNG image data                     |
+| 17    | caretPosition   | host→client | visible(u8) + nx(u16) + ny(u16) + height(u16) — normalized caret position             |
 
 ### Input packet (28 bytes)
 
@@ -333,7 +362,7 @@ The host only captures and sends **one display at a time** — the one the clien
 - **Video stream data is not encrypted** — in relay mode it crosses the public internet between the intranets and the relay. Wrap in WireGuard for sensitive use (see docs/RELAY.md security notes).
 - **Single viewer at a time** — latest session wins; a second client replaces the first.
 - **No retransmission/FEC** — on lossy Wi-Fi, frames may drop until the next keyframe (2s interval). On a clean LAN with high `--bitrate`, loss is rare.
-- **Remote cursor drawn into video** — the host's physical cursor is captured in the frame; the local cursor is hidden over the client window.
+- **Remote cursor not drawn into video** — host uses `showsCursor=false` (cursor not captured in tiles). Client renders the host's actual cursor image received via the cursor shape channel (PNG + hot spot, 20ms polling). Local system cursor moves instantly; cursor shape matches the host exactly.
 - **No audio streaming, no clipboard sync, no file transfer.**
 
 ## Roadmap
