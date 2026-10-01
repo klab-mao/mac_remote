@@ -27,7 +27,7 @@ func TestControlAuthFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	go relay.run()
-	hub := &controlHub{accounts: accounts, relay: relay, hosts: map[string]net.Conn{}}
+	hub := &controlHub{accounts: accounts, relay: relay, hosts: map[string]net.Conn{}, tcpSessions: map[uint64]*tcpSession{}, sessionByConn: map[net.Conn]uint64{}}
 
 	clientConn, serverConn := net.Pipe()
 	go handleControl(serverConn, hub)
@@ -84,7 +84,7 @@ func TestHostRegisterAndSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	go relay.run()
-	hub := &controlHub{accounts: accounts, relay: relay, hosts: map[string]net.Conn{}}
+	hub := &controlHub{accounts: accounts, relay: relay, hosts: map[string]net.Conn{}, tcpSessions: map[uint64]*tcpSession{}, sessionByConn: map[net.Conn]uint64{}}
 
 	hostConn, hostServer := net.Pipe()
 	go handleControl(hostServer, hub)
@@ -121,6 +121,37 @@ func TestHostRegisterAndSession(t *testing.T) {
 	}
 	if !bytes.Equal(payload, hpayload) {
 		t.Fatalf("session info mismatch between sides")
+	}
+	defer hostConn.Close()
+	defer viewerConn.Close()
+	_ = hostConn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = viewerConn.SetDeadline(time.Now().Add(5 * time.Second))
+	writeDone := make(chan error, 1)
+	go func() {
+		for index := 0; index < 200; index++ {
+			if err := writeFrame(hostConn, frData, []byte{byte(index)}); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		writeDone <- nil
+	}()
+	for index := 0; index < 200; index++ {
+		kind, data, err := readFrame(viewerConn)
+		if err != nil || kind != frData || !bytes.Equal(data, []byte{byte(index)}) {
+			t.Fatalf("TCP-only video %d: type=%d data=%v err=%v", index, kind, data, err)
+		}
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	go func() { writeDone <- writeFrame(viewerConn, frData, []byte("key-up")) }()
+	kind, data, err := readFrame(hostConn)
+	if err != nil || kind != frData || string(data) != "key-up" {
+		t.Fatalf("TCP-only input: type=%d data=%q err=%v", kind, data, err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

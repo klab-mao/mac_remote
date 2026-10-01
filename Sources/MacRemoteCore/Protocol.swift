@@ -66,15 +66,16 @@ public protocol Transport: AnyObject {
     var onPacket: ((PacketHeader, Data) -> Void)? { get set }
     var onState: ((String) -> Void)? { get set }
     func start()
-    func sendDatagram(_ data: Data)
+    @discardableResult func sendDatagram(_ data: Data) -> Bool
 }
 
 extension Transport {
-    public func send(type: PacketType, flags: UInt8 = 0, frameId: UInt32 = 0, fragIndex: UInt16 = 0, fragCount: UInt16 = 1, payload: Data) {
+    @discardableResult
+    public func send(type: PacketType, flags: UInt8 = 0, frameId: UInt32 = 0, fragIndex: UInt16 = 0, fragCount: UInt16 = 1, payload: Data) -> Bool {
         let header = PacketHeader(type: type, flags: flags, frameId: frameId, fragIndex: fragIndex, fragCount: fragCount, payloadLength: UInt32(payload.count))
         var d = header.encode()
         d.append(payload)
-        sendDatagram(d)
+        return sendDatagram(d)
     }
 
     public func sendControl(_ subType: ControlSubType, extra: Data = Data()) {
@@ -143,6 +144,8 @@ public struct PacketHeader {
         let fragIndex = UInt16(b[8]) | UInt16(b[9]) << 8
         let fragCount = UInt16(b[10]) | UInt16(b[11]) << 8
         let payloadLength = UInt32(b[12]) | UInt32(b[13]) << 8 | UInt32(b[14]) << 16 | UInt32(b[15]) << 24
+          guard fragCount > 0, fragIndex < fragCount,
+              Int(payloadLength) == data.count - PacketHeader.size else { return nil }
         return PacketHeader(type: type, flags: flags, frameId: frameId, fragIndex: fragIndex, fragCount: fragCount, payloadLength: payloadLength)
     }
 }

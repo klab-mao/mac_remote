@@ -41,6 +41,9 @@ final class HostEngine {
         self.clientTimeout = clientTimeout
         self.relay = relay
         self.codec = codec
+        budgetRate = Double(bitrateMbps) * 125_000
+        budgetMax = max(256_000, budgetRate * 0.25)
+        budgetTokens = budgetMax
     }
 
     func start() {
@@ -56,7 +59,7 @@ final class HostEngine {
         }
 
         regionEncoder.onRegion = { [weak self] fid, x, y, w, h, jpeg in
-            self?.handleRegion(frameId: fid, x: x, y: y, w: w, h: h, jpeg: jpeg)
+            self?.handleRegion(frameId: fid, x: x, y: y, w: w, h: h, jpeg: jpeg) ?? false
         }
 
         regionEncoder.onFrameComplete = { [weak self] fid, count in
@@ -181,7 +184,15 @@ final class HostEngine {
             guard payload.count >= 2 else { return }
             let mbps = Int(payload[1])
             guard mbps >= 5 && mbps <= 100 else { return }
-            encoder.setBitrate(mbps)
+            if useRegionMode {
+                stateLock.lock()
+                budgetRate = Double(min(mbps, bitrateMbps)) * 125_000
+                budgetMax = max(256_000, budgetRate * 0.25)
+                budgetTokens = min(budgetTokens, budgetMax)
+                stateLock.unlock()
+            } else {
+                encoder.setBitrate(mbps)
+            }
             print("Client requested bitrate: \(mbps)Mbps")
         case .switchDisplay:
             guard payload.count >= 2 else { return }
@@ -404,13 +415,13 @@ final class HostEngine {
     private var tileCache: [UInt32: Data] = [:]
     private var tileCacheOrder: [UInt32] = []
     private let tileCacheLimit = 1000
-    private let budgetRate: Double = 2_000_000
-    private let budgetMax: Double = 4_000_000
+    private var budgetRate: Double = 2_000_000
+    private var budgetMax: Double = 500_000
     private var budgetTokens: Double = 2_000_000
     private var budgetLastRefill = Date()
     private var budgetDrops = 0
 
-    private func handleRegion(frameId: UInt32, x: UInt16, y: UInt16, w: UInt16, h: UInt16, jpeg: Data) {
+    private func handleRegion(frameId: UInt32, x: UInt16, y: UInt16, w: UInt16, h: UInt16, jpeg: Data) -> Bool {
         stateLock.lock()
         let t = transport
         let elapsed = Date().timeIntervalSince(lastClientActivity)
@@ -424,10 +435,10 @@ final class HostEngine {
             if !wasTimedOut {
                 print("Client inactive for \(Int(elapsed))s! — pausing video (timeout=\(Int(clientTimeout))s)")
             }
-            return
+            return false
         }
 
-        guard let t else { return }
+        guard let t else { return false }
 
         stateLock.lock()
         let needSize = pendingScreenSize
@@ -447,17 +458,16 @@ final class HostEngine {
         if Double(jpeg.count) > budgetTokens {
             budgetDrops += 1
             if budgetDrops % 200 == 1 {
-                print("bandwidth budget: dropped \(budgetDrops) tiles (tokens=\(Int(budgetTokens)))")
+                Log.v("bandwidth budget: deferred \(budgetDrops) tiles (tokens=\(Int(budgetTokens)))")
             }
             stateLock.unlock()
-            return
+            return false
         }
         budgetTokens -= Double(jpeg.count)
         stateLock.unlock()
 
         stateLock.lock()
-        packetSeq &+= 1
-        let seq = packetSeq
+        let seq = packetSeq &+ 1
         stateLock.unlock()
 
         var payload = Data()
@@ -468,8 +478,14 @@ final class HostEngine {
         payload.appendLE(h)
         payload.appendLE(UInt32(jpeg.count))
         payload.append(jpeg)
-        t.send(type: .region, frameId: seq, payload: payload)
+        guard t.send(type: .region, frameId: seq, payload: payload) else {
+            stateLock.lock()
+            budgetTokens = min(budgetMax, budgetTokens + Double(jpeg.count))
+            stateLock.unlock()
+            return false
+        }
         stateLock.lock()
+        packetSeq = seq
         tileCache[seq] = payload
         tileCacheOrder.append(seq)
         if tileCacheOrder.count > tileCacheLimit {
@@ -477,6 +493,7 @@ final class HostEngine {
             tileCache.removeValue(forKey: evict)
         }
         stateLock.unlock()
+        return true
     }
 
     private func sendScreenSize() {

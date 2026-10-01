@@ -74,8 +74,9 @@ final class RawUDPSocket {
     private let queue: DispatchQueue
     private var source: DispatchSourceRead?
     private var recvBuf = [UInt8](repeating: 0, count: 65536)
+    private var endpoints: [String: sockaddr_in] = [:]
 
-    var onDatagram: ((Data) -> Void)?
+    var onDatagram: ((Data, String, UInt16) -> Void)?
     var onState: ((String) -> Void)?
     private(set) var localPort: UInt16 = 0
 
@@ -121,9 +122,9 @@ final class RawUDPSocket {
         src.setEventHandler { [weak self] in
             self?.doReceive()
         }
-        src.setCancelHandler { [weak self] in
-            guard let self else { return }
-            if self.fd >= 0 { Darwin.close(self.fd); self.fd = -1 }
+        let descriptor = fd
+        src.setCancelHandler {
+            Darwin.close(descriptor)
         }
         src.resume()
         source = src
@@ -139,13 +140,17 @@ final class RawUDPSocket {
             }
         }
         if n > 0 {
-            onDatagram?(Data(recvBuf[0..<Int(n)]))
+            var address = addr.sin_addr
+            var text = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            guard inet_ntop(AF_INET, &address, &text, socklen_t(text.count)) != nil else { return }
+            onDatagram?(Data(recvBuf[0..<Int(n)]), String(cString: text), UInt16(bigEndian: addr.sin_port))
         }
     }
 
     func sendTo(_ data: Data, host: String, port: UInt16) {
         queue.async { [weak self] in
             guard let self else { return }
+            guard self.fd >= 0 else { return }
             guard let sin = self.resolve(host: host, port: port) else {
                 self.onState?("resolve failed: \(host)")
                 return
@@ -153,18 +158,8 @@ final class RawUDPSocket {
             data.withUnsafeBytes { ptr in
                 withUnsafePointer(to: sin) { sinPtr in
                     sinPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saddr in
-                        var retries = 0
-                        var sent = false
-                        while retries < 20 {
-                            let result = sendto(self.fd, ptr.baseAddress, data.count, 0,
-                                               saddr, socklen_t(MemoryLayout<sockaddr_in>.size))
-                            if result >= 0 { sent = true; break }
-                            if errno != EAGAIN && errno != ENOBUFS {
-                                break
-                            }
-                            usleep(500)
-                            retries += 1
-                        }
+                        _ = sendto(self.fd, ptr.baseAddress, data.count, 0,
+                                   saddr, socklen_t(MemoryLayout<sockaddr_in>.size))
                     }
                 }
             }
@@ -172,6 +167,8 @@ final class RawUDPSocket {
     }
 
     private func resolve(host: String, port: UInt16) -> sockaddr_in? {
+        let key = "\(host):\(port)"
+        if let cached = endpoints[key] { return cached }
         var hints = addrinfo()
         hints.ai_family = AF_INET
         hints.ai_socktype = SOCK_DGRAM
@@ -180,13 +177,25 @@ final class RawUDPSocket {
         guard status == 0, let first = result else { return nil }
         defer { freeaddrinfo(first) }
         guard let aiAddr = first.pointee.ai_addr else { return nil }
-        return aiAddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        let address = aiAddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        endpoints[key] = address
+        return address
+    }
+
+    func matches(host: String, port: UInt16, address: String, sourcePort: UInt16) -> Bool {
+        guard port == sourcePort, let expected = resolve(host: host, port: port) else { return false }
+        var actual = in_addr()
+        guard inet_pton(AF_INET, address, &actual) == 1 else { return false }
+        return expected.sin_addr.s_addr == actual.s_addr
     }
 
     func close() {
         source?.cancel()
         source = nil
+        fd = -1
     }
+
+    deinit { close() }
 }
 
 public final class RelayTransport: Transport {
@@ -209,15 +218,17 @@ public final class RelayTransport: Transport {
     private var pingTimer: DispatchSourceTimer?
     private var lastPongTime: Date = .distantFuture
 
-    // Hole punching state
     private var peerHost: String?
     private var peerPort: UInt16 = 0
-    private var directMode = false
-    private var punchTimer: DispatchSourceTimer?
-    private var punchAttempts = 0
+    private var path = RelayPath()
+    private var reportedRoute: RelayPath.Route?
+    private var probes: [UInt8: (token: UInt64, sentAt: TimeInterval)] = [:]
     private var bindTimer: DispatchSourceTimer?
     private var bindPacket = Data()
     private var reconnecting = false
+    private let sendLock = NSLock()
+    private var pendingVideoBytes = 0
+    private let maxPendingVideoBytes = 256 * 1024
 
     private enum Phase {
         case disconnected
@@ -235,21 +246,27 @@ public final class RelayTransport: Transport {
     }
 
     public func start() {
+        queue.async { [weak self] in self?.connect() }
+    }
+
+    private func connect() {
         phase = .awaitingChallenge
         let conn = NWConnection(
             host: NWEndpoint.Host(relayHost),
             port: NWEndpoint.Port(rawValue: controlPort)!,
             using: .tcp
         )
-        conn.stateUpdateHandler = { [weak self] state in
+        conn.stateUpdateHandler = { [weak self, weak conn] state in
+            guard let self, let conn, self.control === conn else { return }
             switch state {
             case .ready:
-                self?.onState?("relay control connected")
+                self.onState?("relay control connected")
             case .failed(let error):
-                self?.onState?("relay control failed: \(error)")
-                self?.reconnect()
+                self.onState?("relay control failed: \(error)")
+                self.reconnectOnQueue()
             case .waiting(let error):
-                self?.onState?("relay control waiting: \(error)")
+                self.onState?("relay control waiting: \(error)")
+                self.reconnectOnQueue()
             default:
                 break
             }
@@ -261,20 +278,31 @@ public final class RelayTransport: Transport {
     }
 
     public func reconnect() {
+        queue.async { [weak self] in self?.reconnectOnQueue() }
+    }
+
+    private func reconnectOnQueue() {
         guard !reconnecting else { return }
         reconnecting = true
         phase = .disconnected
         buffer = Data()
         pingTimer?.cancel(); pingTimer = nil
         bindTimer?.cancel(); bindTimer = nil
-        punchTimer?.cancel(); punchTimer = nil
+        control?.stateUpdateHandler = nil
         control?.cancel()
+        control = nil
+        dataSocket?.close()
         dataSocket = nil
+        peerHost = nil
+        peerPort = 0
+        path = RelayPath()
+        probes.removeAll()
+        fragAssembler.reset()
         onState?("relay reconnecting in 3s...")
         queue.asyncAfter(deadline: .now() + .seconds(3)) { [weak self] in
             guard let self else { return }
             self.reconnecting = false
-            self.start()
+            self.connect()
         }
     }
 
@@ -288,7 +316,7 @@ public final class RelayTransport: Transport {
             let elapsed = Date().timeIntervalSince(self.lastPongTime)
             if elapsed > 20 {
                 self.onState?("relay pong timeout (\(Int(elapsed))s) — forcing reconnect")
-                self.reconnect()
+                self.reconnectOnQueue()
             }
         }
         timer.resume()
@@ -296,15 +324,16 @@ public final class RelayTransport: Transport {
     }
 
     private func scheduleControlReceive() {
-        control?.receive(minimumIncompleteLength: 1, maximumLength: 262144) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
+        guard let connection = control else { return }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 262144) { [weak self] data, _, isComplete, error in
+            guard let self, self.control === connection else { return }
             if let data, !data.isEmpty {
                 self.buffer.append(data)
                 self.processBuffer()
             }
             if isComplete || error != nil {
                 self.onState?("relay control closed (\(error?.localizedDescription ?? "EOF"))")
-                self.reconnect()
+                self.reconnectOnQueue()
                 return
             }
             self.scheduleControlReceive()
@@ -316,6 +345,11 @@ public final class RelayTransport: Transport {
             let typeRaw = UInt16(buffer[buffer.startIndex]) | UInt16(buffer[buffer.startIndex + 1]) << 8
             let len = UInt32(buffer[buffer.startIndex + 2]) | UInt32(buffer[buffer.startIndex + 3]) << 8
                 | UInt32(buffer[buffer.startIndex + 4]) << 16 | UInt32(buffer[buffer.startIndex + 5]) << 24
+            guard len <= 4 * 1024 * 1024 else {
+                onState?("relay control frame exceeds size limit")
+                reconnectOnQueue()
+                return
+            }
             let total = CtrlCodec.headerSize + Int(len)
             guard buffer.count >= total else { return }
             let payload = buffer.subdata(in: (buffer.startIndex + CtrlCodec.headerSize)..<(buffer.startIndex + total))
@@ -377,10 +411,18 @@ public final class RelayTransport: Transport {
 
     private func setupDataPlane(sessionId: UInt64, udpPort: UInt16) {
         self.relayUdpPort = udpPort
+        bindTimer?.cancel()
+        dataSocket?.close()
+        peerHost = nil
+        peerPort = 0
+        path = RelayPath()
+        reportedRoute = nil
+        probes.removeAll()
+        fragAssembler.reset()
 
         let sock = RawUDPSocket(queue: queue)
-        sock.onDatagram = { [weak self] data in
-            self?.handleDataDatagram(data)
+        sock.onDatagram = { [weak self] data, address, port in
+            self?.handleDataDatagram(data, address: address, port: port)
         }
         sock.onState = { [weak self] state in
             self?.onState?("relay data: \(state)")
@@ -397,32 +439,49 @@ public final class RelayTransport: Transport {
         sock.sendTo(bindPacket, host: relayHost, port: udpPort)
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + .seconds(2), repeating: .seconds(2))
+        timer.schedule(deadline: .now(), repeating: .seconds(1))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
             self.dataSocket?.sendTo(self.bindPacket, host: self.relayHost, port: self.relayUdpPort)
+            self.sendProbes()
+            self.reportRoute()
         }
         timer.resume()
         bindTimer = timer
 
         phase = .established
-        onState?("relay session \(sessionId) ready (udp \(udpPort))")
+        onState?("relay session \(sessionId) ready (TCP fallback, probing UDP \(udpPort))")
     }
 
     // MARK: - Data datagram handling (RPEP, PUNCH, or mac_remote packet)
 
     private let fragAssembler = UDPFragAssembler()
 
-    private func handleDataDatagram(_ data: Data) {
-        // Keep bind timer running to refresh NAT mapping and relay address record
-        // RPEP: peer endpoint info from relay
-        if data.count >= 7, data[0..<4] == Data([0x52, 0x50, 0x45, 0x50]) {
-            parsePeerEndpoint(data)
+    private func handleDataDatagram(_ data: Data, address: String, port: UInt16) {
+        let fromRelay = dataSocket?.matches(host: relayHost, port: relayUdpPort, address: address, sourcePort: port) == true
+        let fromPeer = address == peerHost && port == peerPort
+        guard fromRelay || fromPeer else { return }
+        if data.count == 22, data.prefix(4) == Data("RMPB".utf8) {
+            guard readLE64(data, 4) == sessionId else { return }
+            let route = data[12]
+            guard route <= 1, (route == 0 ? fromRelay : fromPeer) else { return }
+            if data[13] == 0 {
+                var response = data
+                response[13] = 1
+                dataSocket?.sendTo(response, host: address, port: port)
+            } else if data[13] == 1, let probe = probes[route],
+                      probe.token == readLE64(data, 14),
+                      ProcessInfo.processInfo.systemUptime - probe.sentAt < 3 {
+                path.acknowledge(direct: route == 1, at: ProcessInfo.processInfo.systemUptime)
+                probes.removeValue(forKey: route)
+                reportRoute()
+            }
             return
         }
-        // PUNCH: hole-punch probe from peer
-        if data.count >= 13, data[0..<5] == Data([0x50, 0x55, 0x4E, 0x43, 0x48]) {
-            onPunchReceived()
+        // Keep bind timer running to refresh NAT mapping and relay address record
+        // RPEP: peer endpoint info from relay
+        if fromRelay, data.count >= 7, data[0..<4] == Data([0x52, 0x50, 0x45, 0x50]) {
+            parsePeerEndpoint(data)
             return
         }
         // Otherwise: mac_remote packet (from relay or peer)
@@ -452,50 +511,41 @@ public final class RelayTransport: Transport {
         if peerHost == ip && peerPort == port { return }
         peerHost = ip
         peerPort = port
-        onState?("peer endpoint: \(ip):\(port) — starting hole punch")
-        startHolePunch()
+        path = RelayPath()
+        probes.removeAll()
+        onState?("peer endpoint: \(ip):\(port) - probing direct route")
     }
 
-    private func startHolePunch() {
-        guard let host = peerHost else { return }
-        if punchTimer != nil { return }
-        punchAttempts = 0
-
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(200))
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            self.punchAttempts += 1
-            if self.punchAttempts > 15 {
-                self.punchTimer?.cancel()
-                self.punchTimer = nil
-                if !self.directMode {
-                    self.onState?("hole punch failed — staying on relay")
-                }
-                return
-            }
-            var punch = Data()
-            punch.append(contentsOf: Array("PUNCH".utf8))
-            punch.appendLE(self.sessionId)
-            self.dataSocket?.sendTo(punch, host: host, port: self.peerPort)
+    private func sendProbes() {
+        let now = ProcessInfo.processInfo.systemUptime
+        for route: UInt8 in [0, 1] {
+            guard route == 0 || peerHost != nil else { continue }
+            if let pending = probes[route], now - pending.sentAt < 3 { continue }
+            let token = UInt64.random(in: 1...UInt64.max)
+            probes[route] = (token, now)
+            var probe = Data("RMPB".utf8)
+            probe.appendLE(sessionId)
+            probe.append(route)
+            probe.append(0)
+            probe.appendLE(token)
+            dataSocket?.sendTo(probe, host: route == 0 ? relayHost : peerHost!,
+                               port: route == 0 ? relayUdpPort : peerPort)
         }
-        timer.resume()
-        punchTimer = timer
     }
 
-    private func onPunchReceived() {
-        if !directMode {
-            directMode = true
-            punchTimer?.cancel()
-            punchTimer = nil
-            onState?("hole punch success — switched to direct mode (peer \(peerHost ?? "?"):\(peerPort))")
+    private func reportRoute() {
+        let route = path.route(at: ProcessInfo.processInfo.systemUptime)
+        if route != reportedRoute {
+            reportedRoute = route
+            onState?("video route: \(route.rawValue)")
         }
     }
 
     // MARK: - Sending
 
-    private func sendCtrl(_ type: CtrlFrameType, _ payload: Data) {
-        control?.send(content: CtrlCodec.frame(type, payload), completion: .contentProcessed { _ in })
+    private func sendCtrl(_ type: CtrlFrameType, _ payload: Data, completion: @escaping () -> Void = {}) {
+        guard let connection = control else { completion(); return }
+        connection.send(content: CtrlCodec.frame(type, payload), completion: .contentProcessed { _ in completion() })
     }
 
     private func readLE64(_ data: Data, _ offset: Int) -> UInt64 {
@@ -506,27 +556,43 @@ public final class RelayTransport: Transport {
         return v
     }
 
-    public func sendDatagram(_ data: Data) {
-        guard phase == .established else { return }
-        
-        if let header = PacketHeader.decode(data), header.type == .control {
-            if data.count > PacketHeader.size && data[PacketHeader.size] == ControlSubType.ping.rawValue {
-                dataSocket?.sendTo(data, host: relayHost, port: relayUdpPort)
-                return
+    @discardableResult
+    public func sendDatagram(_ data: Data) -> Bool {
+        guard let header = PacketHeader.decode(data) else { return false }
+        let cost = header.type == .video || header.type == .region ? data.count : 0
+        sendLock.lock()
+        guard pendingVideoBytes + cost <= maxPendingVideoBytes else {
+            sendLock.unlock()
+            return false
+        }
+        pendingVideoBytes += cost
+        sendLock.unlock()
+        queue.async { [weak self] in
+            self?.sendOnQueue(data) { [weak self] in
+                guard let self else { return }
+                self.sendLock.lock()
+                self.pendingVideoBytes -= cost
+                self.sendLock.unlock()
             }
-            sendCtrl(.data, data)
+        }
+        return true
+    }
+
+    private func sendOnQueue(_ data: Data, completion: @escaping () -> Void) {
+        guard phase == .established, let header = PacketHeader.decode(data) else { completion(); return }
+        let route = path.route(at: ProcessInfo.processInfo.systemUptime)
+        if header.type == .control || header.type == .input || route == .tcp {
+            sendCtrl(.data, data, completion: completion)
             return
         }
-        
-        guard let header = PacketHeader.decode(data) else {
-            sendCtrl(.data, data)
-            return
-        }
+        defer { completion() }
+        let destination = route == .direct ? (peerHost ?? relayHost) : relayHost
+        let destinationPort = route == .direct ? peerPort : relayUdpPort
         let payload = data.subdata(in: PacketHeader.size..<data.count)
         
         let maxFragPayload = 1200 - PacketHeader.size
         if payload.count <= maxFragPayload {
-            dataSocket?.sendTo(data, host: relayHost, port: relayUdpPort)
+            dataSocket?.sendTo(data, host: destination, port: destinationPort)
             return
         }
         
@@ -538,36 +604,53 @@ public final class RelayTransport: Transport {
             let fragHeader = PacketHeader(type: header.type, flags: header.flags, frameId: header.frameId, fragIndex: i, fragCount: fragCount, payloadLength: UInt32(fragPayload.count))
             var fragData = fragHeader.encode()
             fragData.append(fragPayload)
-            dataSocket?.sendTo(fragData, host: relayHost, port: relayUdpPort)
+            dataSocket?.sendTo(fragData, host: destination, port: destinationPort)
         }
     }
 }
 
-private final class UDPFragAssembler {
-    private var frames: [UInt32: (count: UInt16, parts: [UInt16: Data])] = [:]
+final class UDPFragAssembler {
+    private var frames: [UInt64: (count: UInt16, parts: [UInt16: Data], started: TimeInterval)] = [:]
     private let lock = NSLock()
+
+    func reset() {
+        lock.lock()
+        frames.removeAll()
+        lock.unlock()
+    }
     
-    func push(header: PacketHeader, payload: Data) -> Data? {
+    func push(header: PacketHeader, payload: Data, now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Data? {
+        guard header.fragCount > 0, header.fragCount <= 256,
+              header.fragIndex < header.fragCount,
+              payload.count == Int(header.payloadLength), payload.count <= 1200 else { return nil }
         guard header.fragCount > 1 else { return payload }
-        
         lock.lock()
         defer { lock.unlock() }
-        
-        var frame = frames[header.frameId] ?? (count: header.fragCount, parts: [:])
+        frames = frames.filter { now - $0.value.started < 1 }
+        let key = UInt64(header.type.rawValue) << 32 | UInt64(header.frameId)
+        if frames[key] == nil, frames.count >= 64,
+           let oldest = frames.min(by: { $0.value.started < $1.value.started })?.key {
+            frames.removeValue(forKey: oldest)
+        }
+        var frame = frames[key] ?? (count: header.fragCount, parts: [:], started: now)
+        guard frame.count == header.fragCount else {
+            frames.removeValue(forKey: key)
+            return nil
+        }
         frame.parts[header.fragIndex] = payload
-        frames[header.frameId] = frame
+        frames[key] = frame
         
         guard frame.parts.count == Int(frame.count) else { return nil }
         
         var complete = Data()
         for i in 0..<frame.count {
             guard let part = frame.parts[i] else {
-                frames.removeValue(forKey: header.frameId)
+                frames.removeValue(forKey: key)
                 return nil
             }
             complete.append(part)
         }
-        frames.removeValue(forKey: header.frameId)
+        frames.removeValue(forKey: key)
         return complete
     }
 }

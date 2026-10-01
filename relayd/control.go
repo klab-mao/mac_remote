@@ -160,29 +160,32 @@ func handleControl(conn net.Conn, hub *controlHub) {
 			}
 			sessionID := randomSessionID()
 			hub.relay.createSession(sessionID)
-			info := make([]byte, 10)
-			binary.LittleEndian.PutUint64(info, sessionID)
-			binary.LittleEndian.PutUint16(info[8:], uint16(hub.relay.port))
-			if err := writeFrame(conn, frSessionInfo, info); err != nil {
-				break
-			}
-			if err := writeFrame(hostConn, frSessionInfo, info); err != nil {
-				_ = writeFrame(conn, frErr, strPayload("host unreachable"))
-				break
-			}
-			writeCh := make(chan []byte, 60)
+			writeCh := make(chan []byte, 8)
 			done := make(chan struct{})
 			hub.mu.Lock()
 			hub.tcpSessions[sessionID] = &tcpSession{hostConn: hostConn, viewerConn: conn, hostDeviceID: deviceID, writeCh: writeCh, done: done}
 			hub.sessionByConn[hostConn] = sessionID
 			hub.sessionByConn[conn] = sessionID
 			hub.mu.Unlock()
+			info := make([]byte, 10)
+			binary.LittleEndian.PutUint64(info, sessionID)
+			binary.LittleEndian.PutUint16(info[8:], uint16(hub.relay.port))
+			if err := writeFrame(conn, frSessionInfo, info); err != nil {
+				conn.Close()
+				continue
+			}
+			if err := writeFrame(hostConn, frSessionInfo, info); err != nil {
+				_ = writeFrame(conn, frErr, strPayload("host unreachable"))
+				conn.Close()
+				continue
+			}
 			go func() {
 				for {
 					select {
 					case data := <-writeCh:
 						if err := writeFrame(conn, frData, data); err != nil {
 							log.Printf("frData forward error (viewer): %v", err)
+							conn.Close()
 							return
 						}
 					case <-done:
@@ -196,12 +199,14 @@ func handleControl(conn net.Conn, hub *controlHub) {
 			hub.mu.Lock()
 			sid, ok := hub.sessionByConn[conn]
 			var writeCh chan []byte
+			var done <-chan struct{}
 			var dst net.Conn
 			if ok {
 				ts := hub.tcpSessions[sid]
 				if ts != nil {
 					if ts.hostConn == conn {
 						writeCh = ts.writeCh
+						done = ts.done
 					} else {
 						dst = ts.hostConn
 					}
@@ -213,8 +218,7 @@ func handleControl(conn net.Conn, hub *controlHub) {
 				copy(payloadCopy, payload)
 				select {
 				case writeCh <- payloadCopy:
-				default:
-					log.Printf("frData dropped: viewer buffer full (sid=%d)", sid)
+				case <-done:
 				}
 			} else if dst != nil {
 				payloadCopy := make([]byte, len(payload))

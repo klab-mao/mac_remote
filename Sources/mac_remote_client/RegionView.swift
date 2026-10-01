@@ -60,7 +60,7 @@ final class RegionView: NSView {
         caretLayer.isHidden = true
         screenLayer.addSublayer(caretLayer)
 
-        flushTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+        flushTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             self?.flushPendingTiles()
         }
     }
@@ -110,6 +110,9 @@ final class RegionView: NSView {
         }
         tileLayers.removeAll()
         tileLatestFrame.removeAll()
+        frameBuffers.removeAll()
+        expectedTileCounts.removeAll()
+        latestRenderedFrameId = 0
         needsLayout = true
     }
 
@@ -201,8 +204,8 @@ final class RegionView: NSView {
     }
 
     private func flushPendingTiles() {
-        if let maxFid = frameBuffers.keys.max(), maxFid > latestRenderedFrameId {
-            renderFrame(maxFid)
+        for frameId in frameBuffers.keys.sorted() {
+            renderFrame(frameId)
         }
     }
 

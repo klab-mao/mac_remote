@@ -6,7 +6,7 @@ import CoreGraphics
 import Metal
 
 final class RegionEncoder {
-    var onRegion: ((UInt32, UInt16, UInt16, UInt16, UInt16, Data) -> Void)?
+    var onRegion: ((UInt32, UInt16, UInt16, UInt16, UInt16, Data) -> Bool)?
     var onFrameComplete: ((UInt32, Int) -> Void)?
 
     private let tileSize = 128
@@ -24,13 +24,29 @@ final class RegionEncoder {
     private var width: Int = 0
     private var height: Int = 0
     private var forceFullFlag = true
-    private var framesSinceRefresh = 0
-    private let refreshInterval = 60
+    private var lastRefresh: TimeInterval = 0
+    private var pendingTiles = Set<Int>()
+    private var refinementDeadlines: [Int: TimeInterval] = [:]
+    private var nextTile = 0
     private var frameId: UInt32 = 0
     private let lock = NSLock()
     private var cursorX: Int = -1
     private var cursorY: Int = -1
     private let maxTilesPerFrame = 300
+    private var refreshTimer: DispatchSourceTimer?
+    private var lastCapture: TimeInterval = 0
+
+    init(automaticRefresh: Bool = true) {
+        if automaticRefresh {
+            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "mac_remote.refinement"))
+            timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
+            timer.setEventHandler { [weak self] in self?.refreshIdleFrame() }
+            timer.resume()
+            refreshTimer = timer
+        }
+    }
+
+    deinit { refreshTimer?.cancel() }
 
     func setup(width: Int, height: Int) {
         lock.lock()
@@ -39,7 +55,11 @@ final class RegionEncoder {
         self.height = height
         prevPixelBuffer = nil
         forceFullFlag = true
-        framesSinceRefresh = 0
+        lastRefresh = 0
+        pendingTiles.removeAll()
+        refinementDeadlines.removeAll()
+        nextTile = 0
+        qualityEMA = -1
     }
 
     func forceFullFrame() {
@@ -55,147 +75,82 @@ final class RegionEncoder {
         lock.unlock()
     }
 
-    func encode(_ pixelBuffer: CVPixelBuffer, dirtyRects: [CGRect]?, scaleFactor: CGFloat) {
+    func encode(_ pixelBuffer: CVPixelBuffer, dirtyRects: [CGRect]?, scaleFactor: CGFloat, now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         lock.lock()
+        defer { lock.unlock() }
+        lastCapture = now
+        encodeLocked(pixelBuffer, now: now)
+    }
+
+    func refreshIdleFrame(now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard now - lastCapture >= 0.1, let pixelBuffer = prevPixelBuffer else { return }
+        encodeLocked(pixelBuffer, now: now)
+    }
+
+    private func encodeLocked(_ pixelBuffer: CVPixelBuffer, now: TimeInterval) {
         let w = width
         let h = height
-        var force = forceFullFlag
+        let force = forceFullFlag || now - lastRefresh >= 5
         let prev = prevPixelBuffer
         forceFullFlag = false
-        framesSinceRefresh += 1
-        if framesSinceRefresh >= refreshInterval {
-            framesSinceRefresh = 0
-            force = true
-        }
-        lock.unlock()
-
-        guard w > 0, h > 0 else { return }
-        if prev == nil { force = true }
+        if force { lastRefresh = now }
+        guard w > 0, h > 0,
+              CVPixelBufferGetWidth(pixelBuffer) == w,
+              CVPixelBufferGetHeight(pixelBuffer) == h else { return }
 
         frameId &+= 1
         let fid = frameId
-
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        if let prev { CVPixelBufferLockBaseAddress(prev, .readOnly) }
+        defer { if let prev { CVPixelBufferUnlockBaseAddress(prev, .readOnly) } }
+        guard let curBase = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        let curStride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let prevBase = prev.flatMap { CVPixelBufferGetBaseAddress($0) }
+        let prevStride = prev.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
+        let tilesWide = (w + tileSize - 1) / tileSize
+        let tilesHigh = (h + tileSize - 1) / tileSize
+        let tileCount = tilesWide * tilesHigh
+        var changedCount = 0
 
-        var regionCount = 0
-        var totalBytes = 0
-
-        if force {
-            let tilesWide = (w + tileSize - 1) / tileSize
-            let tilesHigh = (h + tileSize - 1) / tileSize
-            for ty in 0..<tilesHigh {
-                for tx in 0..<tilesWide {
-                    let rx = tx * tileSize
-                    let ry = ty * tileSize
-                    let rw = min(tileSize, w - rx)
-                    let rh = min(tileSize, h - ry)
-                    if let jpeg = encodeRegion(pixelBuffer, rx, ry, rw, rh, totalHeight: h) {
-                        onRegion?(fid, UInt16(rx), UInt16(ry), UInt16(rw), UInt16(rh), jpeg)
-                        regionCount += 1
-                        totalBytes += jpeg.count
-                    }
-                }
+        for key in 0..<tileCount {
+            let rx = (key % tilesWide) * tileSize
+            let ry = (key / tilesWide) * tileSize
+            let rw = min(tileSize, w - rx)
+            let rh = min(tileSize, h - ry)
+            let changed = prevBase.map { isTileDirty(curBase, curStride, $0, prevStride, rx, ry, rw, rh) } ?? true
+            if changed {
+                changedCount += 1
+                pendingTiles.insert(key)
+                refinementDeadlines[key] = now + 0.3
+            } else if force || (refinementDeadlines[key].map { now >= $0 } ?? false) {
+                pendingTiles.insert(key)
             }
-        } else {
-            CVPixelBufferLockBaseAddress(prev!, .readOnly)
-            let curBase = CVPixelBufferGetBaseAddress(pixelBuffer)!
-            let curStride = CVPixelBufferGetBytesPerRow(pixelBuffer)
-            let prevBase = CVPixelBufferGetBaseAddress(prev!)!
-            let prevStride = CVPixelBufferGetBytesPerRow(prev!)
-
-            let tilesWide = (w + tileSize - 1) / tileSize
-            let tilesHigh = (h + tileSize - 1) / tileSize
-
-            var candidates: Set<Int>?
-            if let rects = dirtyRects, !rects.isEmpty, scaleFactor > 0, fid % 30 != 0 {
-                var keys = Set<Int>()
-                let hh = CGFloat(h)
-                for r0 in rects.prefix(16) {
-                    let rp = CGRect(x: r0.minX * scaleFactor, y: r0.minY * scaleFactor,
-                                    width: r0.width * scaleFactor, height: r0.height * scaleFactor)
-                    let flipped = CGRect(x: rp.minX, y: hh - rp.maxY, width: rp.width, height: rp.height)
-                    for rr in [rp, flipped] {
-                        let inf = rr.insetBy(dx: -16, dy: -16)
-                        let tx0 = max(0, Int(inf.minX) / tileSize)
-                        let tx1 = min(tilesWide - 1, Int(inf.maxX) / tileSize)
-                        let ty0 = max(0, Int(inf.minY) / tileSize)
-                        let ty1 = min(tilesHigh - 1, Int(inf.maxY) / tileSize)
-                        guard tx0 <= tx1, ty0 <= ty1 else { continue }
-                        for ty in ty0...ty1 {
-                            for tx in tx0...tx1 {
-                                keys.insert((ty << 16) | tx)
-                            }
-                        }
-                    }
-                }
-                if !keys.isEmpty { candidates = keys }
-            }
-
-            var dirtyTiles: [(tx: Int, ty: Int)] = []
-            for ty in 0..<tilesHigh {
-                for tx in 0..<tilesWide {
-                    if let candidates, !candidates.contains((ty << 16) | tx) { continue }
-                    let rx = tx * tileSize
-                    let ry = ty * tileSize
-                    let rw = min(tileSize, w - rx)
-                    let rh = min(tileSize, h - ry)
-
-                    if isTileDirty(curBase, curStride, prevBase, prevStride, rx, ry, rw, rh) {
-                        dirtyTiles.append((tx, ty))
-                    }
-                }
-            }
-
-            let normalized = Double(dirtyTiles.count) / Double(max(tilesWide * tilesHigh, 1))
-            qualityEMA = qualityEMA < 0 ? normalized : qualityEMA * 0.85 + normalized * 0.15
-            let act = min(max(qualityEMA, 0), 1)
-            currentQuality = CGFloat(0.7 - act * 0.5)
-
-            if normalized > 0.7 {
-                lock.lock()
-                forceFullFlag = true
-                lock.unlock()
-            }
-
-            let cx = cursorX
-            let cy = cursorY
-            let largeChange = normalized > 0.5
-            if cx >= 0 && cy >= 0 && dirtyTiles.count > maxTilesPerFrame && !largeChange {
-                dirtyTiles.sort { a, b in
-                    let ax = a.tx * tileSize + tileSize / 2
-                    let ay = a.ty * tileSize + tileSize / 2
-                    let bx = b.tx * tileSize + tileSize / 2
-                    let by = b.ty * tileSize + tileSize / 2
-                    let da = (ax - cx) * (ax - cx) + (ay - cy) * (ay - cy)
-                    let db = (bx - cx) * (bx - cx) + (by - cy) * (by - cy)
-                    return da < db
-                }
-            }
-
-            let limit = largeChange ? dirtyTiles.count : min(dirtyTiles.count, maxTilesPerFrame)
-            for i in 0..<limit {
-                let tx = dirtyTiles[i].tx
-                let ty = dirtyTiles[i].ty
-                let rx = tx * tileSize
-                let ry = ty * tileSize
-                let rw = min(tileSize, w - rx)
-                let rh = min(tileSize, h - ry)
-                if let jpeg = encodeRegion(pixelBuffer, rx, ry, rw, rh, totalHeight: h) {
-                    onRegion?(fid, UInt16(rx), UInt16(ry), UInt16(rw), UInt16(rh), jpeg)
-                    regionCount += 1
-                    totalBytes += jpeg.count
-                }
-            }
-
-            CVPixelBufferUnlockBaseAddress(prev!, .readOnly)
         }
-
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-
-        lock.lock()
+        let activity = Double(changedCount) / Double(tileCount)
+        qualityEMA = qualityEMA < 0 ? activity : qualityEMA * 0.85 + activity * 0.15
+        currentQuality = CGFloat(0.7 - min(max(qualityEMA, 0), 1) * 0.5)
+        var regionCount = 0
+        let startTile = nextTile
+        for offset in 0..<tileCount {
+            let key = (startTile + offset) % tileCount
+            guard pendingTiles.contains(key) else { continue }
+            let rx = (key % tilesWide) * tileSize
+            let ry = (key / tilesWide) * tileSize
+            let rw = min(tileSize, w - rx)
+            let rh = min(tileSize, h - ry)
+            let lossless = refinementDeadlines[key].map { now >= $0 } ?? true
+            guard let image = encodeRegion(pixelBuffer, rx, ry, rw, rh, totalHeight: h, lossless: lossless) else { continue }
+            guard onRegion?(fid, UInt16(rx), UInt16(ry), UInt16(rw), UInt16(rh), image) == true else { break }
+            pendingTiles.remove(key)
+            if lossless { refinementDeadlines.removeValue(forKey: key) }
+            nextTile = (key + 1) % tileCount
+            regionCount += 1
+            if regionCount >= maxTilesPerFrame { break }
+        }
         prevPixelBuffer = pixelBuffer
-        lock.unlock()
-
         onFrameComplete?(fid, regionCount)
     }
 
@@ -205,7 +160,7 @@ final class RegionEncoder {
         let curPtr = curBase.advanced(by: y * curStride + x * 4)
         let prevPtr = prevBase.advanced(by: y * prevStride + x * 4)
         let bytesPerRow = w * 4
-        for row in stride(from: 0, to: h, by: 2) {
+        for row in 0..<h {
             if memcmp(curPtr.advanced(by: row * curStride),
                       prevPtr.advanced(by: row * prevStride),
                       bytesPerRow) != 0 {
@@ -215,11 +170,18 @@ final class RegionEncoder {
         return false
     }
 
-    private func encodeRegion(_ pixelBuffer: CVPixelBuffer, _ x: Int, _ y: Int, _ w: Int, _ h: Int, totalHeight: Int) -> Data? {
+    private func encodeRegion(_ pixelBuffer: CVPixelBuffer, _ x: Int, _ y: Int, _ w: Int, _ h: Int, totalHeight: Int, lossless: Bool) -> Data? {
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let ciY = totalHeight - y - h
         let rect = CGRect(x: x, y: ciY, width: w, height: h)
         guard let cgImage = ciContext.createCGImage(ciImage, from: rect) else { return nil }
+        if lossless {
+            let data = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else { return nil }
+            CGImageDestinationAddImage(destination, cgImage, nil)
+            guard CGImageDestinationFinalize(destination) else { return nil }
+            return data as Data
+        }
         let quality = currentQuality
         if webpSupported != false {
             let webpData = NSMutableData()

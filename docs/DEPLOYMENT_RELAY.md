@@ -1,5 +1,10 @@
 # Relay Server Deployment Guide
 
+For current personal-use commands, security requirements, TCP fallback, and ports
+4430/4431, use [DEPLOYMENT.md](DEPLOYMENT.md). The deployment examples and legacy
+hole-punch sequence below predate the current request/response route probes.
+Always quote a remote home path: `scripts/deploy_relay.sh myserver '~/relay'`.
+
 This document covers deploying the `relayd` server to a remote host, managing accounts, and the NAT hole punching feature that enables direct P2P connections when possible.
 
 ---

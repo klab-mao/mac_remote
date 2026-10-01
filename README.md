@@ -1,376 +1,139 @@
 # mac_remote
 
-Internal-use macOS screen sharing tool (macOS-to-macOS), built as a replacement for the slow built-in Screen Sharing (VNC). Goal: TeamViewer-level smoothness with visually lossless image quality.
+Personal macOS-to-macOS screen sharing with direct LAN/VPN and self-hosted relay
+modes. Requires macOS 13+, Screen Recording and Accessibility permission on the
+host, and a logged-in macOS GUI session.
 
-**Two connection modes:**
+**Use a protected network.** Traffic is not encrypted by the application, and
+direct LAN mode is unauthenticated. Relay account authentication is not encryption.
+Use WireGuard/Tailscale or SSH tunnels before carrying screen contents, keystrokes,
+or unlock passwords over the Internet.
 
-- **LAN mode** — direct UDP between Macs on the same network (lowest latency).
-- **Relay mode** — both sides connect outbound to your own cloud server (`relayd`, Go), bridging two intranets across NAT, with per-user login accounts configured server-side. See [docs/RELAY.md](docs/RELAY.md).
+See [the deployment guide](docs/DEPLOYMENT.md) for your host at `10.203.14.191`,
+the checkout at `/Volumes/mao-data/tools/mac_remote`, and relay `myserver` on
+TCP `4430` / UDP `4431`, including an encrypted SSH-only setup.
 
-## Architecture
-
-```
-Host (controlled Mac)                         Client (viewing Mac)
----------------------                         --------------------
-ScreenCaptureKit (GPU capture, 60fps)
-        |
-RegionEncoder (128x128 tile diffing)
-  - per-tile JPEG encode (Metal CIContext)
-  - frame differencing vs previous frame
-  - adaptive quality (0.2 scroll / 0.7 static)
-  - dirty-rect scan hint (SCStreamFrameInfo)
-  - 2MB/s token-bucket bandwidth budget
-  - periodic full refresh every 60 frames (~1s)
-  - full refresh on >70% dirty tiles (window resize/move)
-        |
-Region packets (UDP, 1-2KB each)  --------->  Streamer (region reassembly)
-        |                                        |    ├─ gap detection → NACK (TCP)
-        |                                        |    └─ NACK retransmission
-        |                                        |
-        |                                  RegionView (CATransaction batched)
-        |                                  (per-tile CALayer rendering)
-        |                                  (stale tile filtering by frameId)
-        |                                  (blinking caret overlay)
-        |
-        +-- cursor image (TCP, 20ms) ----->  NSCursor(image, hotSpot).set()
-        |   (PNG + hot spot + logical size)    (shows exact host cursor)
-        |
-        +-- caret position (TCP, 200ms) --->  CALayer blinking caret overlay
-        |   (AX API: visible + rect)          (500ms blink interval)
-        |
-        +----- input events (UDP) <----------  NSEvent local monitor
-                                                    (mouse/keyboard/scroll)
-Host: CGEvent.post(tap: .cghidEventTap)       Client: borderless fullscreen window
-```
-
-### Key design choices
-
-- **ScreenCaptureKit** — GPU-accelerated capture at full retina resolution (macOS 12.3+). Zero-copy IOSurface pixel buffers passed directly to the encoder.
-- **Region-based JPEG tiles** — 128x128 tile grid with per-tile JPEG encoding (quality 0.35, ~1-2KB/tile). Only dirty tiles are sent. Metal-backed CIContext for GPU-accelerated JPEG encoding. Validated at FPS 261-320.
-- **UDP transport with NACK retransmission** — tiles sent as individual UDP datagrams (fast, no head-of-line blocking). Client detects sequence gaps and sends NACK over TCP (reliable); host re-sends missing tiles from a 1000-entry cache. Self-heal latency ~100ms.
-- **Periodic full refresh** — every 60 frames (~1s), all tiles re-sent individually as a safety-net fallback for any tiles NACK misses. Per-tile delivery 69-83% per refresh.
-- **CATransaction batched rendering** — all tiles from one frame batch are applied atomically via CATransaction to eliminate tearing during scroll/dynamic updates. Stale tiles (older frameId for same position) are discarded to reduce flicker.
-- **Cursor image channel** — host polls `NSCursor.currentSystem` every 20ms, encodes the cursor image as PNG, and sends it via TCP control channel with hot spot + logical size. Client creates `NSCursor(image:hotSpot:)` and calls `cursor.set()`. Client shows exactly the host's cursor — including resize cursors, diagonal cursors, and custom system cursors. No cursor type matching or heuristic detection needed.
-- **Caret blinking via AX API** — host uses `AXUIElementCreateSystemWide()` to detect the focused text field and caret position every 200ms. Client renders a blinking caret overlay (500ms interval) as a CALayer. Works around the macOS limitation where `showsCursor=false` hides both mouse cursor and text caret.
-- **Adaptive JPEG quality** — EMA of dirty tile ratio drives quality: 0.7 when static (sharp), 0.2 during scrolling (more tiles/sec). Keeps traffic under 2MB/s budget without forced drops.
-- **Dirty-rect scan hint** — `SCStreamFrameInfo.dirtyRects` (macOS 12.3+) limits tile scanning to tiles intersecting changed areas. Full scan every 30 frames as safety net.
-- **2MB/s bandwidth budget** — token bucket (4MB burst) drops tiles over budget before sequence assignment, so clients never see gaps. Adaptive quality alone keeps traffic under budget during scroll.
-- **Full refresh on large changes** — when >50% of tiles are dirty, the 300-tile-per-frame cap is removed. When >70% are dirty, the next frame is forced to a full refresh. Makes window resize/move/minimize-restore instant.
-- **Hybrid TCP/UDP transport** — control packets (ping/pong, hello, NACK, screenSize, cursorShape, caretPosition) over TCP (reliable); data packets (region tiles) over UDP (fast, with fragmentation). Pings also routed over UDP to keep NAT alive. UDP hole punching for direct host-client connection when possible.
-- **Normalized input coordinates** — mouse position sent as 0.0-1.0 normalized within the captured display, mapped to global CG coordinates on the host. Retina scaling and multi-monitor offsets handled transparently.
-- **Separate input channel** — input events share the UDP connection but use distinct packet types, keeping them low-latency and independent of video frame timing.
-
-## Project structure
-
-```
-mac_remote/
-  Package.swift                    Swift package (platforms: macOS 13+)
-  Sources/
-    MacRemoteCore/                 Shared library
-      Protocol.swift               Packet header, types, InputPacket, Packetizer, Transport
-      Transport.swift              UDPFlow (NWConnection), UDPListener (NWListener)
-      RelayClient.swift            RelayTransport: hybrid TCP control + UDP data, hole punching, frag reassembly
-    mac_remote_host/               Host executable (the controlled Mac)
-      main.swift                   HostEngine: lifecycle, region handling, NACK handler, tile cache, cursor/caret tracking
-      Capture.swift                CaptureEngine: SCStream multi-display + switching, dirtyRects extraction
-      RegionEncoder.swift          128x128 tile diffing, Metal JPEG encode, adaptive quality, dirty-rect hint, bandwidth budget, full refresh
-      Encoder.swift                H264Encoder: VTCompressionSession wrapper (legacy mode)
-      InputInjector.swift          CGEvent mouse/keyboard/scroll injection (shared CGEventSource for click state)
-      CursorDetector.swift         Legacy cursor type detection (unused — image-based approach supersedes)
-      CaretTracker.swift           AX API caret position polling (system-wide focused element + selected text range)
-    mac_remote_client/             Client executable (the viewing Mac)
-      main.swift                   ClientDelegate: window, streamer, timers, cursor image rendering, caret overlay
-      Streamer.swift               Region reassembly, NACK gap detection, tile seq tracking, cursor/caret callbacks
-      RegionView.swift             CATransaction-batched per-tile CALayer rendering, stale tile filtering, blinking caret overlay
-      InputSender.swift            VideoView, BorderlessWindow, NSEvent monitor
-  relayd/                          Cloud relay server (Go) — bridges two intranets
-    main.go                        Flags, accounts loading, startup
-    control.go                     TCP control: HMAC challenge-response, sessions, frData forwarding
-    udp.go                         UDP data plane: session bind + bidirectional forwarding
-    control_test.go                Integration tests: auth, sessions, forwarding
-  docs/RELAY.md                    Relay deployment guide + protocol reference
-```
-
-## Build
+## Build And Validate
 
 ```sh
-swift build --arch arm64 --arch x86_64   # host + client (universal)
-cd relayd && go build -o relayd .        # relay server (any Linux)
-go test ./...                            # relay server tests
+bash scripts/check.sh
+swift build -c release
 ```
 
-Produces a **universal (fat) binary** so the same executables run on both Apple Silicon and Intel Macs. The x86_64 slice targets macOS 13 (Ventura) minimum.
+The check script requires Swift Command Line Tools and Go. It builds both apps,
+checks route fallback, packet validation, fragment recovery, deferred-tile retry,
+idle PNG refinement and pixel diffing, then runs Go relay integration tests with
+the race detector. With full Xcode, `swift test` also runs the XCTest route suite.
 
-> Plain `swift build` on Apple Silicon produces an arm64-only binary — Intel Macs reject it with `bad CPU type in executable`. Always use `--arch arm64 --arch x86_64`.
->
-> Universal builds require full Xcode (multi-arch builds go through `xcbuild`). With only Command Line Tools installed, `--arch` builds fail — build for the native architecture instead: `swift build -c release`.
-
-Binaries land in `.build/out/Products/Debug/`.
-
-## Permissions (required on the HOST Mac)
-
-The host needs two permissions. Run it once from the terminal, then grant:
-
-1. **Screen Recording** — System Settings > Privacy & Security > Screen Recording: enable the binary (or Terminal). Required for ScreenCaptureKit.
-2. **Accessibility** — System Settings > Privacy & Security > Accessibility: enable the same. Required for `CGEvent.post` (mouse/keyboard injection). Without it, video works but clicks/keys silently do nothing.
-
-Restart the host after granting. The client needs no special permissions.
-
-The host prints permission status at startup:
-
-```
-Screen Recording permission: GRANTED
-Accessibility permission: GRANTED
-```
-
-## Usage
-
-### Host (the Mac being controlled)
+Native binaries are in `.build/release/`. Build on the target Mac if its CPU
+architecture differs. Universal builds require full Xcode:
 
 ```sh
-.build/out/Products/Debug/mac_remote_host [--port 42420] [--fps 60] [--bitrate 40] [--codec h264] [--display 0] [--client-timeout 10]
+swift build -c release --arch arm64 --arch x86_64
 ```
 
-| Flag                 | Default | Description                                                              |
-| -------------------- | ------- | ------------------------------------------------------------------------ |
-| `--port`           | 42420   | UDP port (LAN mode only)                                                 |
-| `--fps`            | 60      | capture/encode framerate                                                 |
-| `--bitrate`        | 40      | bitrate in Mbps (use 60-100 on LAN for near-lossless text)               |
-| `--codec`          | h264    | video codec: `h264` or `hevc` (HEVC is sharper for text/screen content)  |
-| `--display`        | 0       | initial display index (use`--display 1` for second monitor)            |
-| `--client-timeout` | 10      | seconds without client packets before pausing video                      |
-| `--relay R:42430`  | —      | connect to relayd instead of LAN listening                               |
-| `--device-id`      | —      | device name registered on the relay (required with`--relay`)           |
-| `--password`       | —      | device account password (prompted or`$MAC_REMOTE_PASSWORD` if omitted) |
-| `--debug`          | —      | verbose logging                                                          |
+## Connection Modes
 
-Relay mode example (see [docs/RELAY.md](docs/RELAY.md) for server setup):
+| Mode | Video | Input/control | Protection required |
+| --- | --- | --- | --- |
+| Direct LAN/VPN | Hardware H.264 or HEVC over UDP | UDP | Trusted LAN or VPN |
+| Relay | Compressed tiles with settled PNG refinement | TCP | VPN or SSH tunnel |
+
+Relay video starts on TCP, then prefers verified direct UDP or relayed UDP.
+Request/response probes test each UDP route; a route expires after three seconds
+without acknowledgment. Both endpoints should run the updated build. TCP-only
+networks continue to work if the relay control port is reachable.
+
+### Direct Connection
+
+Host:
 
 ```sh
-mac_remote_host --relay relay.example.com:42430 --device-id office-mac
+.build/release/mac_remote_host --port 42420 --fps 60 --bitrate 40 --codec hevc
 ```
 
-The host enumerates all displays at startup and prints them:
-
-```
-Available displays: 2
-  [0] id=3 2560x1440 origin=(0,0)
-  [1] id=1 2560x1440 origin=(2560,0)
-```
-`scripts/install_service.sh` installs the host as a **per-user LaunchAgent** that starts at login and is restarted on crash. It wraps the binary in a `.app` bundle for reliable TCC permission handling on macOS 27+. A system LaunchDaemon would not work: ScreenCaptureKit can only capture from a logged-in GUI session, and TCC permissions are granted per user.
-
-**LAN mode:**
-```sh
-scripts/install_service.sh [--port 42420] [--fps 60] [--bitrate 40] [--codec h264] [--display 0] [--client-timeout 10]
-```
-
-**Relay mode:**
-```sh
-scripts/install_service.sh --relay 150.158.133.56:42430 --device-id office-mac [--password 123456]
-```
-
-Password can also be set via `MAC_REMOTE_PASSWORD` env var instead of `--password`.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--relay HOST:PORT` | — | Relay server address (enables relay mode) |
-| `--device-id NAME` | — | Device name registered on relay (required with `--relay`) |
-| `--password PW` | — | Device password (or `$MAC_REMOTE_PASSWORD`) |
-| `--port N` | 42420 | UDP port (LAN mode only) |
-| `--fps N` | 60 | Capture/encode framerate |
-| `--bitrate N` | 40 | Bitrate in Mbps |
-| `--codec CODEC` | h264 | Video codec: h264 or hevc |
-| `--display N` | 0 | Initial display index |
-| `--client-timeout S` | 10 | Client inactivity timeout |
-| `--binary PATH` | — | Use prebuilt binary instead of building |
-
-It builds a universal Release binary if none exists, wraps it in a `.app` bundle at `~/Library/Application Support/mac_remote/mac_remote_host.app`, writes `~/Library/LaunchAgents/com.mac_remote.host.plist`, and loads it. Re-running replaces the service with the new settings (flags not specified are preserved from the existing plist). Log: `~/Library/Application Support/mac_remote/host.log`.
+Viewer:
 
 ```sh
-launchctl list com.mac_remote.host                           # status
-launchctl kickstart -k gui/$(id -u)/com.mac_remote.host      # restart
-tail -f "$HOME/Library/Application Support/mac_remote/host.log"
-scripts/uninstall_service.sh                                 # stop + remove everything
+.build/release/mac_remote_client 10.203.14.191 --port 42420
 ```
 
-TCC permissions are bound to the `.app` bundle: after installing, grant Screen Recording and Accessibility to `~/Library/Application Support/mac_remote/mac_remote_host.app` in System Settings, then restart the service and check the log for `permission: GRANTED`. If permissions were granted to a previous build and now show NOT GRANTED (stale TCC cache), reboot the Mac to flush the cache.
-```
+### Relay Connection
 
-TCC permissions are bound to the binary **path**: after installing, grant Screen Recording and Accessibility to the installed copy (`~/Library/Application Support/mac_remote/bin/mac_remote_host`) — not the build output — then restart the service and check the log for `permission: GRANTED`.
-
-### Client (the Mac viewing/controlling)
-
-LAN mode:
+Deploy with the remote home directory quoted:
 
 ```sh
-.build/out/Products/Debug/mac_remote_client <host-ip> [--port 42420] [--debug]
+scripts/deploy_relay.sh myserver '~/relay' --control-port 4430 --udp-port 4431
 ```
 
-Relay mode (login against server-side accounts, then connect to a registered device):
+Use a relay address reachable through your private VPN, or follow the SSH tunnel
+instructions in the deployment guide:
 
 ```sh
-.build/out/Products/Debug/mac_remote_client --relay relay.example.com:42430 --user alice --device-id office-mac
+.build/release/mac_remote_host --relay RELAY_VPN_IP:4430 \
+  --device-id office-mac --fps 30 --bitrate 12
+.build/release/mac_remote_client --relay RELAY_VPN_IP:4430 \
+  --user alice --device-id office-mac
 ```
 
-Password is prompted with echo disabled (`--password` or `$MAC_REMOTE_PASSWORD` for non-interactive use).
+Use your existing account names. Passwords are prompted without echo; the apps
+also accept `MAC_REMOTE_PASSWORD`. `myserver` may be an SSH-only alias, so it is
+not automatically an application-resolvable relay address.
 
-The client opens a borderless fullscreen window (level: floating, activation policy: regular). Mouse, scroll wheel, keyboard (with modifiers), and drag events are forwarded to the host.
+## Quality And Latency
 
-### Hotkeys
+- Relay mode sends 128x128 changed tiles. Motion uses adaptive lossy quality;
+  settled tiles are scheduled for lossless PNG refinement after about 300 ms.
+- Deferred tiles remain pending and retry with current pixels, including while
+  the desktop is idle. Fair rotation prevents later screen areas starving.
+- Every pixel row is compared, including single-row text/caret changes. A full
+  refresh is scheduled every five seconds to repair unrecovered packet loss.
+- `--bitrate` caps relay tile payload traffic as well as configuring LAN video.
+  Set it below available bandwidth; overhead and retransmissions are additional.
+- Video admission is bounded at 256 KiB in the Swift relay transport. The Go
+  relay uses a bounded queue with backpressure instead of silently dropping TCP
+  data. OS socket buffers are additional.
+- Client tile flushing runs at a 60 Hz timer cadence and drains all pending
+  frames with per-tile stale-update filtering.
+- Fragment assembly validates metadata, expires incomplete assemblies, and caps
+  outstanding fragmented packets. Reconnect resets sockets and route state.
 
-| Key                   | Action                                                     |
-| --------------------- | ---------------------------------------------------------- |
-| **ESC**         | Quit the client                                            |
-| **Cmd+Shift+D** | Cycle to the next display on the host                      |
-| **Cmd+Shift+U** | Unlock the remote Mac's lock screen (prompts for password) |
+There is no promise of lossless 60 fps on every network. Motion remains lossy,
+TCP can stall behind lost packets, and the tile budget does not automatically
+measure available link capacity. Hardware video over a private VPN is generally
+the better fit for sustained full-screen motion. Live latency and quality still
+need validation on your two Macs.
 
-When switching displays, an overlay shows `Display X / Y` for ~2.5 seconds. The host reconfigures the encoder if the new display has a different resolution and forces a keyframe.
+## Service And Controls
 
-### Screen lock / unlock
+Install the host as a per-user LaunchAgent, not a system LaunchDaemon:
 
-The host watches `com.apple.screenIsLocked` / `com.apple.screenIsUnlocked` distributed notifications and reports lock state changes to the client (shown as a transient overlay).
-
-To unlock a locked remote Mac, press **Cmd+Shift+U** on the client, enter the host's login password, and confirm. The host then:
-
-1. Wakes the displays (power assertion + mouse nudge),
-2. Types the password into the loginwindow password field via synthetic CGEvents (US ANSI key mapping), and presses Return,
-3. Verifies the result by polling the session lock state (`CGSessionCopyCurrentDictionary`) for up to 3s and reports a result code back to the client.
-
-**Limitations:**
-
-- **Secure Event Input** — macOS may block synthetic keyboard events from reaching the loginwindow password field (this is an intentional security hardening). The host self-verifies and the client shows `Unlock failed — still locked` if it didn't work. In that case, unlock once physically. There is no supported way for a non-privileged process to bypass Secure Input.
-- **Password characters are limited to the US ANSI printable set** (letters, digits, common punctuation). Passwords with other characters are rejected with a clear message rather than typed incorrectly.
-- **The password travels unencrypted over UDP** in cleartext — this tool is designed for trusted LAN/VPN use only.
-- Apple Watch / Touch ID unlock cannot be triggered remotely.
-
-## Protocol
-
-### Packet header (16 bytes, little-endian)
-
-```
-[1] version    (always 1)
-[1] type       (0=video, 1=input, 2=control, 3=region)
-[1] flags      (video: bit 0 = keyframe)
-[1] reserved
-[4] frameId
-[2] fragIndex
-[2] fragCount
-[4] payloadLength
+```sh
+scripts/install_service.sh --binary .build/release/mac_remote_host \
+  --port 42420 --fps 60 --bitrate 40 --codec hevc
 ```
 
-### Control subtypes
+The installer preserves unspecified existing settings, including relay settings.
+See the deployment guide before switching an existing service between modes.
+The installed app is `~/Library/Application Support/mac_remote/mac_remote_host.app`.
+Grant Screen Recording and Accessibility to that app, then restart the service.
 
-| Value | Name            | Direction    | Payload                                                                               |
-| ----- | --------------- | ------------ | ------------------------------------------------------------------------------------- |
-| 0     | hello           | client→host | —                                                                                    |
-| 1     | helloAck        | host→client | —                                                                                    |
-| 2     | params          | host→client | codec + param sets (SPS+PPS for H.264, VPS+SPS+PPS for HEVC)                           |
-| 3     | keyframeRequest | client→host | —                                                                                    |
-| 4     | switchDisplay   | client→host | display index (255 = cycle next)                                                      |
-| 5     | displayInfo     | host→client | current index, total count                                                            |
-| 6     | unlockRequest   | client→host | password (UTF-8)                                                                      |
-| 7     | unlockResult    | host→client | result code (0=unlocked, 1=notLocked, 2=stillLocked, 3=unsupportedCharacter, 4=error) |
-| 8     | lockState       | host→client | 1 = locked, 0 = unlocked                                                              |
-| 9     | ping            | both        | heartbeat (routed over UDP to keep NAT alive)                                         |
-| 10    | pong            | both        | heartbeat reply                                                                       |
-| 11    | setBitrate      | client→host | new bitrate in Mbps                                                                   |
-| 12    | nack            | client→host | missing fragment sequence numbers                                                     |
-| 13    | screenSize      | host→client | width (UInt16) + height (UInt16)                                                      |
-| 14    | tileNack        | client→host | missing tile sequence numbers (TCP reliable)                                          |
-| 15    | frameComplete   | host→client | frameId (UInt32) + tileCount (UInt16) — triggers atomic frame render                   |
-| 16    | cursorShape     | host→client | hotX(f32) + hotY(f32) + width(f32) + height(f32) + PNG image data                     |
-| 17    | caretPosition   | host→client | visible(u8) + nx(u16) + ny(u16) + height(u16) — normalized caret position             |
+| Shortcut | Action |
+| --- | --- |
+| ESC | Exit viewer |
+| Cmd+Shift+D | Switch host display |
+| Cmd+Shift+U | Request remote unlock; protected connections only |
 
-### Input packet (28 bytes)
+No audio, clipboard, file transfer, Keychain integration, built-in encryption,
+or per-device viewer authorization is provided. Treat the relay and all its users
+as trusted. The relay UDP socket currently requires IPv4.
 
-```
-[1] kind        (0=mouseMove, 1=mouseDown, 2=mouseUp, 3=scroll, 4=keyDown, 5=keyUp, 6=flagsChanged)
-[1] button      (0=left, 1=right, 2=middle)
-[2] keyCode     (CGKeyCode)
-[4] flags       (CGEventFlags, device-independent mask)
-[4] nx          (normalized X, 0.0-1.0, top-left origin)
-[4] ny          (normalized Y, 0.0-1.0, top-left origin)
-[4] dx          (scroll delta X)
-[4] dy          (scroll delta Y)
-[4] clickCount
-```
+## Project Layout
 
-## Diagnostics
-
-Both sides print diagnostic logs for the first few events to help troubleshoot:
-
-**Host:**
-
-```
-Encoder setup: 2560x1440 40Mbps...
-Encoder ready: 2560x1440 40Mbps H.264 HW
-encoded #1: 307157 bytes, keyframe=true, frags=237
-input #1: kind=mouseDown button=0 nx=0.5 ny=0.5 -> global (1280,720)
-```
-
-**Client:**
-
-```
-Format ready: 2560x1440
-monitor saw leftMouseDown: ... match=true isKey=true
-input captured #1: kind=mouseDown button=0 nx=0.5 ny=0.5
-fps: 60
-```
-
-If clicks aren't working, check:
-
-1. Host prints `Accessibility permission: GRANTED` — if not, grant it and restart.
-2. Host prints `input #1:` lines — if not, the client isn't sending (check client log).
-3. Client prints `input captured #1:` — if not, `normalizedPoint` is returning nil (check for `normalizedPoint nil:` log showing zero bounds/remoteSize).
-4. Client prints `displayLayer FAILED` — video decode layer failed, will request keyframe.
-
-## Disconnect / reconnect
-
-### Client timeout (bandwidth saving)
-
-The host tracks the last time a packet was received from the client. If no packet arrives within `--client-timeout` seconds (default 10), the host stops sending video frames and logs:
-
-```
-Client inactive for 12s — stopping video (timeout=10s)
-```
-
-The capture engine keeps running (for fast resume), but no network traffic is generated. When the client sends any packet again (hello, input, keyframe request), the host immediately resumes:
-
-```
-Client reconnected, resuming video
-```
-
-The client continuously sends hello + keyframe requests every 0.5s as a heartbeat, so the host can detect reconnection within 1 second.
-
-### VPN disconnect
-
-If a company VPN drops mid-session:
-
-1. **UDP packets are lost** — neither side receives the other's packets while the VPN is down.
-2. **Host stops sending** after `--client-timeout` seconds of no client packets.
-3. **Client detects no video** after 5s and logs `No video for 5s — reconnecting (sending hello...)`.
-4. **When VPN resumes**, the client's heartbeat hello packets reach the host again, the host resumes sending, and the client logs `Reconnected — video resumed`.
-
-No manual restart is needed. The connection self-heals as long as the VPN comes back. If the VPN is down longer than the host's timeout, there may be a brief delay (1-2s) while the host waits for a keyframe request before resuming.
-
-### Single-display bandwidth
-
-The host only captures and sends **one display at a time** — the one the client is currently viewing. Switching displays (Cmd+Shift+D) tells the host to stop capturing the old display and start capturing the new one. No bandwidth is wasted on displays the client isn't viewing.
-
-## Known issues
-
-- **Video stream data is not encrypted** — in relay mode it crosses the public internet between the intranets and the relay. Wrap in WireGuard for sensitive use (see docs/RELAY.md security notes).
-- **Single viewer at a time** — latest session wins; a second client replaces the first.
-- **No retransmission/FEC** — on lossy Wi-Fi, frames may drop until the next keyframe (2s interval). On a clean LAN with high `--bitrate`, loss is rare.
-- **Remote cursor not drawn into video** — host uses `showsCursor=false` (cursor not captured in tiles). Client renders the host's actual cursor image received via the cursor shape channel (PNG + hot spot, 20ms polling). Local system cursor moves instantly; cursor shape matches the host exactly.
-- **No audio streaming, no clipboard sync, no file transfer.**
-
-## Roadmap
-
-- End-to-end encryption (DTLS/QUIC) for relay mode.
-- P2P hole punching through the relay (direct path when NAT allows, relay as fallback).
-- Adaptive bitrate based on packet loss / RTT.
-- HEVC/AV1 encode option (VideoToolbox supports both on Apple Silicon).
-- Clipboard sync channel.
-- Pause capture engine (not just skip send) when client times out, to save CPU.
-- LaunchDaemon / menu-bar app packaging for the host.
+- `Sources/MacRemoteCore`: packet protocol, UDP flow, relay routing and transport.
+- `Sources/mac_remote_host`: capture, hardware video, tile encoding and input injection.
+- `Sources/mac_remote_client`: decoding, rendering and input capture.
+- `relayd`: Go authentication, session control and TCP/UDP forwarding.
+- `Tests`: focused Swift route tests and Command Line Tools smoke checks.
+- `scripts`: deployment, host service management and local verification.
+- `docs`: deployment guide and historical wire-protocol references.

@@ -13,6 +13,7 @@ let package = Package(
         .executableTarget(
             name: "mac_remote_client",
             dependencies: ["MacRemoteCore"]
-        )
+        ),
+        .testTarget(name: "MacRemoteCoreTests", dependencies: ["MacRemoteCore"])
     ]
 )

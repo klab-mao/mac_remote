@@ -48,10 +48,12 @@ public final class UDPFlow: Transport {
         }
     }
 
-    public func sendDatagram(_ data: Data) {
+    @discardableResult
+    public func sendDatagram(_ data: Data) -> Bool {
         connection.send(content: data, completion: .contentProcessed { error in
             if let error { Log.v("UDP send error: \(error)") }
         })
+        return true
     }
 
 }
