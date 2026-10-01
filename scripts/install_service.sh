@@ -109,12 +109,6 @@ if [ -n "$RELAY" ] && [ -z "$PASSWORD" ] && [ -n "${MAC_REMOTE_PASSWORD:-}" ]; t
     PASSWORD="$MAC_REMOTE_PASSWORD"
 fi
 
-# Validate relay args
-if [ -n "$RELAY" ] && [ -z "$DEVICE_ID" ]; then
-    echo "error: --device-id is required when --relay is given" >&2
-    exit 1
-fi
-
 # ---- detect install vs upgrade -----------------------------------------------
 
 UPGRADE=false
@@ -149,6 +143,12 @@ except: pass
     [ -z "$CODEC" ]          && CODEC="$(read_plist_flag --codec)"             && [ -n "$CODEC" ]          && echo "    --codec $CODEC"
 else
     echo "==> Fresh install — no existing plist found"
+fi
+
+# Validate relay args (after preservation so --device-id can come from the plist)
+if [ -n "$RELAY" ] && [ -z "$DEVICE_ID" ]; then
+    echo "error: --device-id is required when --relay is given" >&2
+    exit 1
 fi
 
 # ---- fill defaults for anything still unset ----------------------------------

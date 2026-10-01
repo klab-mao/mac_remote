@@ -93,11 +93,13 @@ if [ ! -f "$BIN_LOCAL" ]; then
 fi
 
 # ---- upload binary ------------------------------------------------------------
+# Upload to a temp name and rename over the target: replacing a running binary
+# via rename(2) succeeds where open-for-write fails with "Text file busy".
 
 echo "==> Uploading relayd to ${SSH_HOST}:${REMOTE_DIR}/"
 ssh "$SSH_HOST" "mkdir -p ${REMOTE_DIR}"
-scp "$BIN_LOCAL" "${SSH_HOST}:${REMOTE_DIR}/relayd"
-ssh "$SSH_HOST" "chmod +x ${REMOTE_DIR}/relayd"
+scp "$BIN_LOCAL" "${SSH_HOST}:${REMOTE_DIR}/relayd.new"
+ssh "$SSH_HOST" "mv -f ${REMOTE_DIR}/relayd.new ${REMOTE_DIR}/relayd && chmod +x ${REMOTE_DIR}/relayd"
 
 # ---- accounts.json ------------------------------------------------------------
 
