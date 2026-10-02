@@ -68,6 +68,22 @@ final class HostEngine {
 
         capture.onFrame = { [weak self] pixelBuffer, time, dirtyRects, scaleFactor in
             guard let self else { return }
+            // Idle gate: drop frames BEFORE the expensive encode step when no
+            // client has been active recently (handlePacket refreshes the
+            // activity timestamp and clears the flag to force a keyframe).
+            self.stateLock.lock()
+            let elapsed = Date().timeIntervalSince(self.lastClientActivity)
+            let wasTimedOut = self.clientTimedOut
+            if elapsed > self.clientTimeout {
+                self.clientTimedOut = true
+            }
+            self.stateLock.unlock()
+            if elapsed > self.clientTimeout {
+                if !wasTimedOut {
+                    print("Client inactive — pausing capture/encode (timeout=\(Int(self.clientTimeout))s)")
+                }
+                return
+            }
             if self.useRegionMode {
                 self.regionEncoder.encode(pixelBuffer, dirtyRects: dirtyRects, scaleFactor: scaleFactor)
             } else {

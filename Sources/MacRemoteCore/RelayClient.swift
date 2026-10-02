@@ -252,8 +252,9 @@ public final class RelayTransport: Transport {
     private var reportedRoute: RelayPath.Route?
     private var probes: [UInt8: (token: UInt64, sentAt: TimeInterval)] = [:]
     private var bindTimer: DispatchSourceTimer?
-    private var natKeepaliveTimer: DispatchSourceTimer?
     private var bindPacket = Data()
+    private var lastDataActivity: TimeInterval = 0
+    private var lastIdleBind: TimeInterval = 0
     private var reconnecting = false
     private let sendLock = NSLock()
     private var pendingVideoBytes = 0
@@ -317,7 +318,6 @@ public final class RelayTransport: Transport {
         buffer = Data()
         pingTimer?.cancel(); pingTimer = nil
         bindTimer?.cancel(); bindTimer = nil
-        natKeepaliveTimer?.cancel(); natKeepaliveTimer = nil
         control?.stateUpdateHandler = nil
         control?.cancel()
         control = nil
@@ -455,6 +455,8 @@ public final class RelayTransport: Transport {
         reportedRoute = nil
         probes.removeAll()
         fragAssembler.reset()
+        lastDataActivity = ProcessInfo.processInfo.systemUptime
+        lastIdleBind = 0
 
         let sock = RawUDPSocket(queue: queue)
         sock.onDatagram = { [weak self] data, address, port in
@@ -483,21 +485,23 @@ public final class RelayTransport: Transport {
         }
         sock.sendTo(bindPacket, host: relayHost, port: udpPort)
 
-        let keepalive = DispatchSource.makeTimerSource(queue: queue)
-        keepalive.schedule(deadline: .now() + .seconds(10), repeating: .seconds(10))
-        keepalive.setEventHandler { [weak self] in
-            guard let self else { return }
-            self.dataSocket?.sendTo(self.bindPacket, host: self.relayHost, port: self.relayUdpPort)
-        }
-        keepalive.resume()
-        natKeepaliveTimer = keepalive
-
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(2000))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            self.sendProbes()
-            self.reportRoute()
+            let now = ProcessInfo.processInfo.systemUptime
+            // Active session: 1Hz bind + probes keep the NAT mapping open and
+            // the direct-route measurement fresh. Idle session: nothing to
+            // probe — send a keepalive bind only every 30s (relayd expires
+            // idle sessions after 120s) to stay registered with the relay.
+            if now - self.lastDataActivity < 10 {
+                self.dataSocket?.sendTo(self.bindPacket, host: self.relayHost, port: self.relayUdpPort)
+                self.sendProbes()
+                self.reportRoute()
+            } else if now - self.lastIdleBind >= 30 {
+                self.lastIdleBind = now
+                self.dataSocket?.sendTo(self.bindPacket, host: self.relayHost, port: self.relayUdpPort)
+            }
         }
         timer.resume()
         bindTimer = timer
@@ -542,6 +546,7 @@ public final class RelayTransport: Transport {
         }
         // Otherwise: mac_remote packet (from relay or peer)
         if let header = PacketHeader.decode(data) {
+            lastDataActivity = ProcessInfo.processInfo.systemUptime
             let payload = data.subdata(in: PacketHeader.size..<data.count)
             if header.fragCount > 1 {
                 if let complete = fragAssembler.push(header: header, payload: payload) {
@@ -668,6 +673,7 @@ public final class RelayTransport: Transport {
     }
 
     private func sendOnQueue(_ data: Data, completion: @escaping () -> Void) {
+        lastDataActivity = ProcessInfo.processInfo.systemUptime
         guard phase == .established, let header = PacketHeader.decode(data) else { completion(); return }
         let route = path.route(at: ProcessInfo.processInfo.systemUptime)
         if header.type == .control || header.type == .input || route == .tcp {
