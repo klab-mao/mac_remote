@@ -3,4 +3,6 @@
 .codeartsdoer/
 *.xcodeproj/
 DerivedData/
-.DS_Storerelayd/relayd
+.DS_Store
+relayd/relayd
+relayd/relayd-linux-*

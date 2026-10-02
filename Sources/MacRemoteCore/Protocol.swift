@@ -67,6 +67,7 @@ public protocol Transport: AnyObject {
     var onState: ((String) -> Void)? { get set }
     func start()
     @discardableResult func sendDatagram(_ data: Data) -> Bool
+    @discardableResult func sendBypass(_ data: Data) -> Bool
 }
 
 extension Transport {
@@ -80,6 +81,13 @@ extension Transport {
 
     public func sendControl(_ subType: ControlSubType, extra: Data = Data()) {
         sendDatagram(Packetizer.controlPacket(subType, extra: extra))
+    }
+}
+
+extension Transport {
+    @discardableResult
+    public func sendBypass(_ data: Data) -> Bool {
+        return sendDatagram(data)
     }
 }
 

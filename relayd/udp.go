@@ -17,10 +17,14 @@ const (
 )
 
 type relaySession struct {
-	id       uint64
-	host     *net.UDPAddr
-	client   *net.UDPAddr
-	lastSeen time.Time
+	id             uint64
+	host           *net.UDPAddr
+	client         *net.UDPAddr
+	hostLocal      *net.UDPAddr
+	clientLocal    *net.UDPAddr
+	lastSentHost   string
+	lastSentClient string
+	lastSeen       time.Time
 }
 
 type udpRelay struct {
@@ -74,16 +78,36 @@ func (r *udpRelay) handlePacket(b []byte, addr *net.UDPAddr) {
 		default:
 			return
 		}
+		if len(b) >= 14 {
+			localIpLen := int(b[13])
+			if localIpLen > 0 && len(b) >= 14+localIpLen+2 {
+				localIP := net.ParseIP(string(b[14 : 14+localIpLen]))
+				localPort := binary.LittleEndian.Uint16(b[14+localIpLen : 14+localIpLen+2])
+				if localIP != nil {
+					localAddr := &net.UDPAddr{IP: localIP, Port: int(localPort)}
+					switch b[12] {
+					case bindSideHost:
+						s.hostLocal = localAddr
+					case bindSideClient:
+						s.clientLocal = localAddr
+					}
+				}
+			}
+		}
 		s.lastSeen = time.Now()
 		r.byAddr[addr.String()] = s
 		log.Printf("session %d: bound %s endpoint %s", id, sideName(b[12]), addr)
 
-		// If both sides are now bound, send each side the other's public endpoint
-		// for NAT hole punching.
 		if s.host != nil && s.client != nil {
-			r.sendPeerEndpoint(s.host, s.client)
-			r.sendPeerEndpoint(s.client, s.host)
-			log.Printf("session %d: sent peer endpoints for hole punching", id)
+			hostStr := s.host.String()
+			clientStr := s.client.String()
+			if hostStr != s.lastSentHost || clientStr != s.lastSentClient {
+				r.sendPeerEndpoint(s.host, s.client, s.clientLocal)
+				r.sendPeerEndpoint(s.client, s.host, s.hostLocal)
+				s.lastSentHost = hostStr
+				s.lastSentClient = clientStr
+				log.Printf("session %d: sent peer endpoints for hole punching", id)
+			}
 		}
 		return
 	}
@@ -141,17 +165,29 @@ func sideName(side byte) string {
 	return "client"
 }
 
-// sendPeerEndpoint sends a RPEP message to `to` containing the public endpoint of `peer`.
-// Format: "RPEP" (4B) + [u8 ipLen] [ip bytes] [u16 port LE]
-func (r *udpRelay) sendPeerEndpoint(to, peer *net.UDPAddr) {
+// sendPeerEndpoint sends a RPEP message to `to` containing the public endpoint of `peer`
+// and optionally the local (LAN) endpoint for ICE host candidate hole punching.
+// Format: "RPEP" (4B) + [u8 pubIpLen] [pubIp] [u16 pubPort LE] + [u8 localIpLen] [localIp] [u16 localPort LE]
+func (r *udpRelay) sendPeerEndpoint(to, peer, peerLocal *net.UDPAddr) {
 	ip := peer.IP.String()
 	ipBytes := []byte(ip)
-	msg := make([]byte, 0, 4+1+len(ipBytes)+2)
+	msg := make([]byte, 0, 4+1+len(ipBytes)+2+1+16+2)
 	msg = append(msg, rpepMagic...)
 	msg = append(msg, byte(len(ipBytes)))
 	msg = append(msg, ipBytes...)
 	port := make([]byte, 2)
 	binary.LittleEndian.PutUint16(port, uint16(peer.Port))
 	msg = append(msg, port...)
+	if peerLocal != nil {
+		localIP := peerLocal.IP.String()
+		localIPBytes := []byte(localIP)
+		msg = append(msg, byte(len(localIPBytes)))
+		msg = append(msg, localIPBytes...)
+		localPort := make([]byte, 2)
+		binary.LittleEndian.PutUint16(localPort, uint16(peerLocal.Port))
+		msg = append(msg, localPort...)
+	} else {
+		msg = append(msg, 0)
+	}
 	_, _ = r.conn.WriteToUDP(msg, to)
 }

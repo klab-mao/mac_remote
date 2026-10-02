@@ -10,6 +10,7 @@ final class RegionEncoder {
     var onFrameComplete: ((UInt32, Int) -> Void)?
 
     private let tileSize = 128
+    private let maxTileBytes = 1100
     private var currentQuality: CGFloat = 0.5
     private var qualityEMA: Double = -1
     private var webpSupported: Bool?
@@ -189,7 +190,11 @@ final class RegionEncoder {
                 CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
                 if CGImageDestinationFinalize(dest) {
                     webpSupported = true
-                    return webpData as Data
+                    let result = webpData as Data
+                    if result.count <= maxTileBytes || lossless {
+                        return result
+                    }
+                    return reencodeSmall(cgImage, quality: quality * 0.4)
                 }
             }
             if webpSupported == nil {
@@ -200,6 +205,19 @@ final class RegionEncoder {
         let mutableData = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(mutableData, "public.jpeg" as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        let result = mutableData as Data
+        if result.count <= maxTileBytes {
+            return result
+        }
+        return reencodeSmall(cgImage, quality: quality * 0.4)
+    }
+
+    private func reencodeSmall(_ cgImage: CGImage, quality: CGFloat) -> Data? {
+        let q = max(quality, 0.1)
+        let mutableData = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(mutableData, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: q] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return mutableData as Data
     }

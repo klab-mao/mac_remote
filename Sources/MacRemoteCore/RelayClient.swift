@@ -198,6 +198,31 @@ final class RawUDPSocket {
     deinit { close() }
 }
 
+private func getLocalLANIP() -> String? {
+    var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddrPtr) == 0, let firstAddr = ifaddrPtr else { return nil }
+    defer { freeifaddrs(firstAddr) }
+    var ptr: UnsafeMutablePointer<ifaddrs>? = ifaddrPtr
+    while let cur = ptr {
+        let addrPtr = cur.pointee.ifa_addr
+        if addrPtr != nil && addrPtr!.pointee.sa_family == sa_family_t(AF_INET) {
+            let name = String(cString: cur.pointee.ifa_name)
+            if name.hasPrefix("en") || name.hasPrefix("eth") {
+                var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                let len = socklen_t(addrPtr!.pointee.sa_len)
+                if getnameinfo(addrPtr!, len, &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 {
+                    let ip = String(cString: hostname)
+                    if !ip.hasPrefix("127.") && !ip.hasPrefix("169.254.") {
+                        return ip
+                    }
+                }
+            }
+        }
+        ptr = cur.pointee.ifa_next
+    }
+    return nil
+}
+
 public final class RelayTransport: Transport {
     public var onPacket: ((PacketHeader, Data) -> Void)?
     public var onState: ((String) -> Void)?
@@ -220,10 +245,14 @@ public final class RelayTransport: Transport {
 
     private var peerHost: String?
     private var peerPort: UInt16 = 0
+    private var peerLocalHost: String?
+    private var peerLocalPort: UInt16 = 0
+    private var directUsesLocal = false
     private var path = RelayPath()
     private var reportedRoute: RelayPath.Route?
     private var probes: [UInt8: (token: UInt64, sentAt: TimeInterval)] = [:]
     private var bindTimer: DispatchSourceTimer?
+    private var natKeepaliveTimer: DispatchSourceTimer?
     private var bindPacket = Data()
     private var reconnecting = false
     private let sendLock = NSLock()
@@ -288,6 +317,7 @@ public final class RelayTransport: Transport {
         buffer = Data()
         pingTimer?.cancel(); pingTimer = nil
         bindTimer?.cancel(); bindTimer = nil
+        natKeepaliveTimer?.cancel(); natKeepaliveTimer = nil
         control?.stateUpdateHandler = nil
         control?.cancel()
         control = nil
@@ -295,6 +325,9 @@ public final class RelayTransport: Transport {
         dataSocket = nil
         peerHost = nil
         peerPort = 0
+        peerLocalHost = nil
+        peerLocalPort = 0
+        directUsesLocal = false
         path = RelayPath()
         probes.removeAll()
         fragAssembler.reset()
@@ -415,6 +448,9 @@ public final class RelayTransport: Transport {
         dataSocket?.close()
         peerHost = nil
         peerPort = 0
+        peerLocalHost = nil
+        peerLocalPort = 0
+        directUsesLocal = false
         path = RelayPath()
         reportedRoute = nil
         probes.removeAll()
@@ -436,13 +472,30 @@ public final class RelayTransport: Transport {
         let side: UInt8
         if case .host = role { side = 1 } else { side = 2 }
         bindPacket.append(side)
+        let localIP = getLocalLANIP()
+        if let lip = localIP {
+            let ipBytes = Array(lip.utf8)
+            bindPacket.append(UInt8(ipBytes.count))
+            bindPacket.append(contentsOf: ipBytes)
+            bindPacket.appendLE(sock.localPort)
+        } else {
+            bindPacket.append(0)
+        }
         sock.sendTo(bindPacket, host: relayHost, port: udpPort)
 
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .seconds(1))
-        timer.setEventHandler { [weak self] in
+        let keepalive = DispatchSource.makeTimerSource(queue: queue)
+        keepalive.schedule(deadline: .now() + .seconds(10), repeating: .seconds(10))
+        keepalive.setEventHandler { [weak self] in
             guard let self else { return }
             self.dataSocket?.sendTo(self.bindPacket, host: self.relayHost, port: self.relayUdpPort)
+        }
+        keepalive.resume()
+        natKeepaliveTimer = keepalive
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(2000))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
             self.sendProbes()
             self.reportRoute()
         }
@@ -459,7 +512,7 @@ public final class RelayTransport: Transport {
 
     private func handleDataDatagram(_ data: Data, address: String, port: UInt16) {
         let fromRelay = dataSocket?.matches(host: relayHost, port: relayUdpPort, address: address, sourcePort: port) == true
-        let fromPeer = address == peerHost && port == peerPort
+        let fromPeer = (address == peerHost && port == peerPort) || (address == peerLocalHost && port == peerLocalPort)
         guard fromRelay || fromPeer else { return }
         if data.count == 22, data.prefix(4) == Data("RMPB".utf8) {
             guard readLE64(data, 4) == sessionId else { return }
@@ -472,6 +525,9 @@ public final class RelayTransport: Transport {
             } else if data[13] == 1, let probe = probes[route],
                       probe.token == readLE64(data, 14),
                       ProcessInfo.processInfo.systemUptime - probe.sentAt < 3 {
+                if route == 1 {
+                    directUsesLocal = address == peerLocalHost && port == peerLocalPort
+                }
                 path.acknowledge(direct: route == 1, at: ProcessInfo.processInfo.systemUptime)
                 probes.removeValue(forKey: route)
                 reportRoute()
@@ -501,19 +557,38 @@ public final class RelayTransport: Transport {
     // MARK: - Hole punching
 
     private func parsePeerEndpoint(_ data: Data) {
-        // Format: "RPEP" (4B) + [u8 ipLen] [ip bytes] [u16 port LE]
+        // Format: "RPEP" (4B) + [u8 pubIpLen] [pubIp] [u16 pubPort LE] + [u8 localIpLen] [localIp] [u16 localPort LE]
         guard data.count >= 7 else { return }
-        let ipLen = Int(data[4])
-        guard data.count >= 5 + ipLen + 2 else { return }
-        let ip = String(data: data.subdata(in: 5..<(5 + ipLen)), encoding: .utf8) ?? ""
-        let port = UInt16(data[5 + ipLen]) | UInt16(data[5 + ipLen + 1]) << 8
+        let pubIpLen = Int(data[4])
+        guard data.count >= 5 + pubIpLen + 2 else { return }
+        let pubIp = String(data: data.subdata(in: 5..<(5 + pubIpLen)), encoding: .utf8) ?? ""
+        let pubPort = UInt16(data[5 + pubIpLen]) | UInt16(data[5 + pubIpLen + 1]) << 8
 
-        if peerHost == ip && peerPort == port { return }
-        peerHost = ip
-        peerPort = port
+        let localStart = 5 + pubIpLen + 2
+        var newLocalHost: String? = nil
+        var newLocalPort: UInt16 = 0
+        if data.count >= localStart + 1 {
+            let localIpLen = Int(data[localStart])
+            if localIpLen > 0 && data.count >= localStart + 1 + localIpLen + 2 {
+                newLocalHost = String(data: data.subdata(in: (localStart + 1)..<(localStart + 1 + localIpLen)), encoding: .utf8)
+                newLocalPort = UInt16(data[localStart + 1 + localIpLen]) | UInt16(data[localStart + 1 + localIpLen + 1]) << 8
+            }
+        }
+
+        if peerHost == pubIp && peerPort == pubPort &&
+           peerLocalHost == newLocalHost && peerLocalPort == newLocalPort { return }
+        peerHost = pubIp
+        peerPort = pubPort
+        peerLocalHost = newLocalHost
+        peerLocalPort = newLocalPort
+        directUsesLocal = false
         path = RelayPath()
         probes.removeAll()
-        onState?("peer endpoint: \(ip):\(port) - probing direct route")
+        if let lh = newLocalHost {
+            onState?("peer endpoint: \(pubIp):\(pubPort) (local: \(lh):\(newLocalPort)) - probing direct route")
+        } else {
+            onState?("peer endpoint: \(pubIp):\(pubPort) - probing direct route")
+        }
     }
 
     private func sendProbes() {
@@ -528,8 +603,14 @@ public final class RelayTransport: Transport {
             probe.append(route)
             probe.append(0)
             probe.appendLE(token)
-            dataSocket?.sendTo(probe, host: route == 0 ? relayHost : peerHost!,
-                               port: route == 0 ? relayUdpPort : peerPort)
+            if route == 0 {
+                dataSocket?.sendTo(probe, host: relayHost, port: relayUdpPort)
+            } else {
+                dataSocket?.sendTo(probe, host: peerHost!, port: peerPort)
+                if let lh = peerLocalHost, peerLocalPort > 0 {
+                    dataSocket?.sendTo(probe, host: lh, port: peerLocalPort)
+                }
+            }
         }
     }
 
@@ -578,6 +659,14 @@ public final class RelayTransport: Transport {
         return true
     }
 
+    @discardableResult
+    public func sendBypass(_ data: Data) -> Bool {
+        queue.async { [weak self] in
+            self?.sendOnQueue(data) {}
+        }
+        return true
+    }
+
     private func sendOnQueue(_ data: Data, completion: @escaping () -> Void) {
         guard phase == .established, let header = PacketHeader.decode(data) else { completion(); return }
         let route = path.route(at: ProcessInfo.processInfo.systemUptime)
@@ -586,11 +675,23 @@ public final class RelayTransport: Transport {
             return
         }
         defer { completion() }
-        let destination = route == .direct ? (peerHost ?? relayHost) : relayHost
-        let destinationPort = route == .direct ? peerPort : relayUdpPort
+        let destination: String
+        let destinationPort: UInt16
+        if route == .direct {
+            if directUsesLocal, let lh = peerLocalHost, peerLocalPort > 0 {
+                destination = lh
+                destinationPort = peerLocalPort
+            } else {
+                destination = peerHost ?? relayHost
+                destinationPort = peerPort
+            }
+        } else {
+            destination = relayHost
+            destinationPort = relayUdpPort
+        }
         let payload = data.subdata(in: PacketHeader.size..<data.count)
         
-        let maxFragPayload = 1200 - PacketHeader.size
+        let maxFragPayload = 1400 - PacketHeader.size
         if payload.count <= maxFragPayload {
             dataSocket?.sendTo(data, host: destination, port: destinationPort)
             return
@@ -622,7 +723,7 @@ final class UDPFragAssembler {
     func push(header: PacketHeader, payload: Data, now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Data? {
         guard header.fragCount > 0, header.fragCount <= 256,
               header.fragIndex < header.fragCount,
-              payload.count == Int(header.payloadLength), payload.count <= 1200 else { return nil }
+              payload.count == Int(header.payloadLength), payload.count <= 1400 else { return nil }
         guard header.fragCount > 1 else { return payload }
         lock.lock()
         defer { lock.unlock() }

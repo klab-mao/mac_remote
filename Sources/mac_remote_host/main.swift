@@ -20,7 +20,7 @@ final class HostEngine {
     private var listener: UDPListener?
     private var frameId: UInt32 = 0
     private var currentDisplayID: CGDirectDisplayID = CGMainDisplayID()
-    private var lastClientActivity: Date = .distantPast
+    private var lastClientActivity: Date = Date()
     private var clientTimedOut = false
     private var keyframeBuffer: [UInt32: [Data]] = [:]
     private let regionEncoder = RegionEncoder()
@@ -257,7 +257,10 @@ final class HostEngine {
             let cached = tileCache[seq]
             stateLock.unlock()
             if let cached = cached {
-                t.send(type: .region, frameId: seq, payload: cached)
+                let header = PacketHeader(type: .region, flags: 0, frameId: seq, fragIndex: 0, fragCount: 1, payloadLength: UInt32(cached.count))
+                var datagram = header.encode()
+                datagram.append(cached)
+                t.sendBypass(datagram)
                 retransmitted += 1
             }
         }
@@ -414,7 +417,7 @@ final class HostEngine {
     private var packetSeq: UInt32 = 0
     private var tileCache: [UInt32: Data] = [:]
     private var tileCacheOrder: [UInt32] = []
-    private let tileCacheLimit = 1000
+    private let tileCacheLimit = 5000
     private var budgetRate: Double = 2_000_000
     private var budgetMax: Double = 500_000
     private var budgetTokens: Double = 2_000_000
